@@ -972,7 +972,7 @@ def launch_gui() -> None:
             self.entry(paths, self.wasm_var).grid(row=1, column=1, sticky="ew", ipady=7)
             self.button(paths, "Browse", self.choose_wasm).grid(row=1, column=2, padx=(12, 0))
 
-            display_card, display = self.card(body, "Display", "Higher default resolution for an OC3-style workspace.")
+            display_card, display = self.card(body, "Display", "Higher default resolution for a wider workspace.")
             display_card.grid(row=2, column=0, sticky="ew")
             self.button(display, "1280 x 780", lambda: self.geometry("1280x780")).pack(side=tk.LEFT)
             self.button(display, "1440 x 900", lambda: self.geometry("1440x900")).pack(side=tk.LEFT, padx=(10, 0))
