@@ -1,0 +1,25 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local build dependencies and caches
+.build_tools/
+.pip_tmp/
+.tmp/
+.tmp2/
+build/
+
+# Failed temp folders from local sandbox/tempfile behavior
+tmp*/
+.pmdg_livery_tmp_*/
+.test_workspace_*/
+
+# PyInstaller output: keep the final executable only
+dist/*
+!dist/*.exe
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
