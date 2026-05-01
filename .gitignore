@@ -8,6 +8,7 @@ __pycache__/
 .tmp/
 .tmp2/
 build/
+release/
 
 # Failed temp folders from local sandbox/tempfile behavior
 tmp*/

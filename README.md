@@ -1,60 +1,142 @@
-# PMDG Livery Installer for MSFS 2024
+# PMDG Livery Installer MSFS2024
 
-一个不依赖 PMDG Operations Center 3 的 PMDG 涂装安装工具，面向 Microsoft Flight Simulator 2024。
+Standalone livery management for PMDG aircraft in Microsoft Flight Simulator 2024, with an OC3-inspired interface and no dependency on PMDG Operations Center 3.
+
+面向 Microsoft Flight Simulator 2024 PMDG 机模的独立涂装管理工具，采用类似 OC3 的界面，不依赖 PMDG Operations Center 3。
+
+![Icon](assets/pmdg_livery_installer_icon.png)
+
+<details open>
+<summary>English</summary>
+
+## Overview
+
+PMDG Livery Installer MSFS2024 helps you manage compatible PMDG aircraft liveries for MSFS 2024. It can find installed PMDG products, add liveries from ZIP files or folders, check package status, run diagnostics, and keep your livery library organized.
+
+## Features
+
+- OC3-inspired multi-page interface.
+- `Products` page for scanning installed PMDG aircraft packages and viewing package details.
+- `Liveries` page for installing compatible ZIP or folder liveries.
+- `Diagnostics` page for path checks, package checks, and layout rebuilds.
+- `Settings` page for saved paths, install behavior, and display size.
+- Automatic MSFS 2024 Community and WASM path detection.
+- Automatic PMDG package scanning under `Community`.
+- Supports common PMDG MSFS 2024 livery package structures.
+- Rebuilds `layout.json` after installation.
+- Updates package metadata when applicable.
+- Backs up the original `layout.json` by default.
+
+## Requirements
+
+- Windows.
+- PMDG aircraft installed in MSFS 2024.
+- A compatible PMDG MSFS 2024 livery ZIP or extracted livery folder.
+
+This tool does not convert MSFS 2020 liveries and does not install `.ptp` packages.
+
+## Download And Run
+
+Download the installer from the GitHub Releases page and run:
+
+```text
+PMDG Livery Installer MSFS2024 Setup v0.1.0.exe
+```
+
+Portable executable builds are also available in:
+
+```text
+dist\PMDG Livery Installer MSFS2024.exe
+```
+
+## Basic Use
+
+1. Open the app.
+2. Go to `Products` and refresh installed products.
+3. Go to `Liveries`.
+4. Select the target PMDG aircraft package.
+5. Select a livery ZIP or extracted folder.
+6. Click `Install Livery`.
+7. Start MSFS 2024 and check the aircraft livery list.
+
+## Command Line
+
+Detect paths:
+
+```powershell
+python .\pmdg_livery_installer.py --detect
+```
+
+Install with a package root:
+
+```powershell
+python .\pmdg_livery_installer.py `
+  --package-root "D:\MSFS2024\Community\pmdg-aircraft-738" `
+  --livery "D:\Downloads\my-pmdg-738-livery.zip"
+```
+
+## Build
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
+```
+
+</details>
+
+<details>
+<summary>中文</summary>
+
+## 简介
+
+PMDG Livery Installer MSFS2024 用于管理 MSFS 2024 中兼容的 PMDG 机模涂装。它可以查找已安装的 PMDG 产品，从 ZIP 或文件夹添加涂装，检查安装状态，运行诊断，并帮助整理涂装库。
 
 ## 功能
 
-- 安装 MSFS 2024 版 PMDG livery `.zip` 或已解压文件夹。
-- 自动探测 MSFS 2024 `Community`、`Community2024` 和 `WASM\MSFS2024` 常见路径。
-- 自动扫描 `Community` 下的 `pmdg-aircraft-*` 包。
-- 左侧 OC3 风格分页：
-  - `Products`：扫描 PMDG 产品、查看 manifest/layout/飞机文件夹/涂装数量。
-  - `Liveries`：选择产品并安装 ZIP 或文件夹涂装。
-  - `Diagnostics`：检查路径可写性、产品结构，并可重建所选产品的 `layout.json`。
-  - `Settings`：保存默认路径、覆盖/备份选项，并切换更高分辨率窗口尺寸。
-- 支持两类常见涂装结构：
-  - 压缩包内含 `SimObjects\Airplanes\...\liveries\pmdg\...`
-  - 压缩包或文件夹本身就是一个 livery 文件夹，包含 `livery.cfg`、`texture.*`、`model.*` 或 `panel.*`
-- 安装后自动重建 PMDG 包根目录的 `layout.json`。
-- 若 `manifest.json` 含 `total_package_size`，会同步更新该字段。
-- 默认备份原 `layout.json` 为 `layout.json.bak-YYYYMMDD-HHMMSS`。
+- 类似 OC3 的多分页界面。
+- `Products` 页面：扫描已安装的 PMDG 机模包并查看产品详情。
+- `Liveries` 页面：安装兼容的 ZIP 或文件夹涂装。
+- `Diagnostics` 页面：检查路径、检查产品结构、重建 `layout.json`。
+- `Settings` 页面：保存路径、安装行为和窗口尺寸。
+- 自动探测 MSFS 2024 Community 和 WASM 路径。
+- 自动扫描 `Community` 下的 PMDG 机模包。
+- 支持常见 PMDG MSFS 2024 涂装包结构。
+- 安装后自动重建 `layout.json`。
+- 在适用时更新包元数据。
+- 默认备份原始 `layout.json`。
 
-## 前提
+## 要求
 
 - Windows。
-- Python 3.10 或更高版本。
-- 需要先在 MSFS 2024 中安装并至少加载过对应 PMDG 机模。Marketplace 机模如果仍是 streamed 状态，通常不会有可写入的 PMDG 包目录。
-- 此工具只处理 MSFS 2024 可用的 ZIP/文件夹涂装，不转换 MSFS 2020 贴图格式，也不安装 `.ptp`。
+- 已在 MSFS 2024 中安装 PMDG 机模。
+- 兼容 PMDG MSFS 2024 的涂装 ZIP 或已解压涂装文件夹。
 
-## 图形界面使用
+本工具不转换 MSFS 2020 涂装，也不安装 `.ptp` 包。
 
-如果使用已打包版本，直接运行：
+## 下载和运行
 
-```powershell
-.\dist\"PMDG Livery Installer MSFS2024.exe"
+从 GitHub Releases 下载安装包并运行：
+
+```text
+PMDG Livery Installer MSFS2024 Setup v0.1.0.exe
 ```
 
-双击运行：
+便携版可执行文件也位于：
 
-```powershell
-run_installer.bat
+```text
+dist\PMDG Livery Installer MSFS2024.exe
 ```
 
-或在当前目录运行：
+## 基本使用
 
-```powershell
-python .\pmdg_livery_installer.py
-```
+1. 打开程序。
+2. 进入 `Products` 页面并刷新已安装产品。
+3. 进入 `Liveries` 页面。
+4. 选择目标 PMDG 机模包。
+5. 选择涂装 ZIP 或已解压文件夹。
+6. 点击 `Install Livery`。
+7. 启动 MSFS 2024，在对应机型的涂装列表中检查。
 
-步骤：
-
-1. 确认或手动选择 MSFS 2024 `Community` 路径。
-2. 点击 `Refresh`，选择对应的 `pmdg-aircraft-*` 包，例如 `pmdg-aircraft-738`。
-3. 选择涂装 `.zip` 或已解压文件夹。
-4. 点击 `Install livery`。
-5. 启动 MSFS 2024 检查对应机型的涂装列表。
-
-## 命令行使用
+## 命令行
 
 探测路径：
 
@@ -62,7 +144,7 @@ python .\pmdg_livery_installer.py
 python .\pmdg_livery_installer.py --detect
 ```
 
-用完整 PMDG 包路径安装：
+使用完整包路径安装：
 
 ```powershell
 python .\pmdg_livery_installer.py `
@@ -70,41 +152,10 @@ python .\pmdg_livery_installer.py `
   --livery "D:\Downloads\my-pmdg-738-livery.zip"
 ```
 
-通过 Community 和包名安装：
-
-```powershell
-python .\pmdg_livery_installer.py `
-  --community "D:\MSFS2024\Community" `
-  --package pmdg-aircraft-738 `
-  --livery "D:\Downloads\my-pmdg-738-livery.zip"
-```
-
-如果确定要覆盖同名文件：
-
-```powershell
-python .\pmdg_livery_installer.py `
-  --package-root "D:\MSFS2024\Community\pmdg-aircraft-738" `
-  --livery "D:\Downloads\my-pmdg-738-livery.zip" `
-  --overwrite
-```
-
-## 注意事项
-
-- 建议关闭 MSFS 2024 后再安装涂装。
-- 如果涂装作者要求把 `SimObjects` 拖进 `Community\pmdg-aircraft-738`，本工具会自动完成同等操作并更新 `layout.json`。
-- 如果涂装压缩包里附带 `MSFSLayoutGenerator.exe`，本工具不会复制它，也不需要它。
-- 如果安装后游戏内不显示，优先确认该涂装明确支持 MSFS 2024 和你的 PMDG 机型变体。
-
-## 重新打包
-
-如果修改了源码或图标，运行：
+## 构建
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 ```
 
-输出文件位于：
-
-```text
-dist\PMDG Livery Installer MSFS2024.exe
-```
+</details>
