@@ -2,8 +2,8 @@
 """
 PMDG Livery Installer for MSFS 2024.
 
-Installs MSFS 2024 PMDG livery ZIP/folder packages without PMDG OC3 by copying
-the livery files into an existing PMDG aircraft package and rebuilding
+Installs MSFS 2024 PMDG livery ZIP/PTP/folder packages without PMDG OC3 by
+copying the livery files into an existing PMDG aircraft package and rebuilding
 layout.json.
 """
 
@@ -153,10 +153,10 @@ def validate_package_root(package_root: Path) -> Path:
     return package_root
 
 
-def safe_extract_zip(zip_path: Path, target_dir: Path) -> None:
-    zip_path = normalize_path(zip_path)
+def safe_extract_archive(archive_path: Path, target_dir: Path) -> None:
+    archive_path = normalize_path(archive_path)
     try:
-        with zipfile.ZipFile(zip_path) as archive:
+        with zipfile.ZipFile(archive_path) as archive:
             for item in archive.infolist():
                 raw_name = item.filename.replace("\\", "/")
                 rel = PurePosixPath(raw_name)
@@ -172,7 +172,44 @@ def safe_extract_zip(zip_path: Path, target_dir: Path) -> None:
                 with archive.open(item) as source, destination.open("wb") as dest:
                     shutil.copyfileobj(source, dest)
     except zipfile.BadZipFile as exc:
-        raise InstallerError(f"Not a valid ZIP file: {zip_path}") from exc
+        if archive_path.suffix.lower() == ".ptp":
+            raise InstallerError(
+                "This .ptp file is not a readable archive. Only ZIP-based PMDG "
+                "PTP packages can be installed directly."
+            ) from exc
+        raise InstallerError(f"Not a valid ZIP file: {archive_path}") from exc
+
+
+def contains_installable_content(root: Path) -> bool:
+    return bool(find_simobjects_roots(root) or find_direct_livery_folders(root))
+
+
+def extract_nested_ptp_files(root: Path, temp_dir: Path) -> Path:
+    if contains_installable_content(root):
+        return root
+
+    ptp_files = sorted(root.rglob("*.ptp"), key=lambda p: len(p.parts))
+    if not ptp_files:
+        return root
+
+    nested_root = temp_dir / "nested_ptp"
+    nested_root.mkdir(parents=True, exist_ok=True)
+    extracted_any = False
+    errors: list[str] = []
+    for ptp_file in ptp_files:
+        target = nested_root / ptp_file.stem
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            safe_extract_archive(ptp_file, target)
+            extracted_any = True
+        except InstallerError as exc:
+            errors.append(f"{ptp_file.name}: {exc}")
+
+    if extracted_any:
+        return nested_root
+    if errors:
+        raise InstallerError("; ".join(errors))
+    return root
 
 
 def source_root_from_input(input_path: Path, temp_dir: Path) -> Path:
@@ -181,12 +218,12 @@ def source_root_from_input(input_path: Path, temp_dir: Path) -> Path:
         raise InstallerError(f"Livery path does not exist: {input_path}")
 
     if input_path.is_file():
-        if input_path.suffix.lower() != ".zip":
-            raise InstallerError("Only .zip files or extracted livery folders are supported.")
+        if input_path.suffix.lower() not in {".zip", ".ptp"}:
+            raise InstallerError("Only .zip/.ptp files or extracted livery folders are supported.")
         extract_root = temp_dir / "extracted"
         extract_root.mkdir(parents=True, exist_ok=True)
-        safe_extract_zip(input_path, extract_root)
-        return extract_root
+        safe_extract_archive(input_path, extract_root)
+        return extract_nested_ptp_files(extract_root, temp_dir)
 
     return input_path
 
@@ -464,7 +501,8 @@ def install_livery(
             if not livery_folders:
                 raise InstallerError(
                     "No installable livery structure found. Expected a SimObjects "
-                    "folder or a livery folder containing livery.cfg/texture/model/panel."
+                    "folder, a ZIP-based PTP package, or a livery folder containing "
+                    "livery.cfg/texture/model/panel."
                 )
             copied_files, copied_dirs, installed_roots = copy_direct_liveries(
                 livery_folders,
@@ -539,8 +577,8 @@ def launch_gui() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.title("PMDG Livery Installer MSFS2024")
-            self.geometry("1280x780")
-            self.minsize(1180, 720)
+            self.geometry("1440x900")
+            self.minsize(1280, 760)
             self.configure(bg=self.COLORS["bg"])
             icon_path = app_resource_path("assets/pmdg_livery_installer_icon.ico")
             if icon_path.exists():
@@ -827,6 +865,9 @@ def launch_gui() -> None:
                 activestyle="none",
             )
             self.product_listbox.grid(row=0, column=0, sticky="nsew")
+            product_scrollbar = ttk.Scrollbar(list_body, orient=tk.VERTICAL, command=self.product_listbox.yview)
+            product_scrollbar.grid(row=0, column=1, sticky="ns")
+            self.product_listbox.configure(yscrollcommand=product_scrollbar.set)
             self.product_listbox.bind("<<ListboxSelect>>", self.on_product_select)
 
             detail_card, detail_body = self.card(content, "Product Details", "Manifest, layout, aircraft folders and livery inventory.")
@@ -845,6 +886,9 @@ def launch_gui() -> None:
                 font=("Consolas", 10),
             )
             self.product_detail_text.grid(row=0, column=0, sticky="nsew")
+            detail_scrollbar = ttk.Scrollbar(detail_body, orient=tk.VERTICAL, command=self.product_detail_text.yview)
+            detail_scrollbar.grid(row=0, column=1, sticky="ns")
+            self.product_detail_text.configure(yscrollcommand=detail_scrollbar.set)
             return page
 
         def _create_liveries_page(self):
@@ -881,7 +925,7 @@ def launch_gui() -> None:
             self.package_combo.grid(row=1, column=0, sticky="ew", padx=(0, 8), ipady=4)
             self.button(package, "Refresh", self.refresh_packages).grid(row=1, column=1)
 
-            install_card, install = self.card(content, "Livery Package", "Select a ZIP or extracted livery folder.")
+            install_card, install = self.card(content, "Livery Package", "Select a ZIP, PTP, or extracted livery folder.")
             install_card.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 14))
             install.columnconfigure(1, weight=1)
             self.label(install, "Source", 9, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(0, 12))
@@ -917,6 +961,9 @@ def launch_gui() -> None:
                 font=("Consolas", 9),
             )
             self.log_text.grid(row=0, column=0, sticky="nsew")
+            log_scrollbar = ttk.Scrollbar(log_body, orient=tk.VERTICAL, command=self.log_text.yview)
+            log_scrollbar.grid(row=0, column=1, sticky="ns")
+            self.log_text.configure(yscrollcommand=log_scrollbar.set)
             return page
 
         def _create_diagnostics_page(self):
@@ -949,6 +996,9 @@ def launch_gui() -> None:
                 font=("Consolas", 10),
             )
             self.diagnostics_text.grid(row=0, column=0, sticky="nsew")
+            diagnostics_scrollbar = ttk.Scrollbar(report, orient=tk.VERTICAL, command=self.diagnostics_text.yview)
+            diagnostics_scrollbar.grid(row=0, column=1, sticky="ns")
+            self.diagnostics_text.configure(yscrollcommand=diagnostics_scrollbar.set)
             return page
 
         def _create_settings_page(self):
@@ -1232,12 +1282,12 @@ def launch_gui() -> None:
 
         def choose_zip(self) -> None:
             path = filedialog.askopenfilename(
-                title="Select livery ZIP",
-                filetypes=[("ZIP files", "*.zip"), ("All files", "*.*")],
+                title="Select livery ZIP or PTP",
+                filetypes=[("PMDG livery packages", "*.zip *.ptp"), ("ZIP files", "*.zip"), ("PTP files", "*.ptp"), ("All files", "*.*")],
             )
             if path:
                 self.livery_var.set(path)
-                self.status_var.set("Livery ZIP selected")
+                self.status_var.set("Livery package selected")
 
         def choose_livery_folder(self) -> None:
             path = filedialog.askdirectory(title="Select extracted livery folder")

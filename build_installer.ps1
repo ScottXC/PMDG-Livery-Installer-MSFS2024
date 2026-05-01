@@ -17,7 +17,7 @@ python .\tools\run_pyinstaller_fixed_temp.py `
   --clean `
   --onefile `
   --windowed `
-  --name "PMDG Livery Installer MSFS2024 Setup v0.1.0" `
+  --name "PMDG Livery Installer MSFS2024 Setup v0.1.1" `
   --icon ".\assets\pmdg_livery_installer_icon.ico" `
   --add-data ".\dist\PMDG Livery Installer MSFS2024.exe;payload" `
   --add-data ".\assets\pmdg_livery_installer_icon.ico;payload" `
@@ -25,4 +25,4 @@ python .\tools\run_pyinstaller_fixed_temp.py `
   .\installer.py
 
 Write-Host ""
-Write-Host "Built: $releaseDir\PMDG Livery Installer MSFS2024 Setup v0.1.0.exe"
+Write-Host "Built: $releaseDir\PMDG Livery Installer MSFS2024 Setup v0.1.1.exe"

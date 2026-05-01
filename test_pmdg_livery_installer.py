@@ -70,6 +70,60 @@ class InstallerTests(unittest.TestCase):
             manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
             self.assertNotEqual(manifest["total_package_size"], "0")
 
+    def test_installs_zip_based_ptp(self) -> None:
+        with workspace_root() as root:
+            package = make_package(root)
+            ptp_path = root / "livery.ptp"
+            with zipfile.ZipFile(ptp_path, "w") as archive:
+                archive.writestr(
+                    "SimObjects/Airplanes/PMDG 737-800/liveries/pmdg/PTP Livery/livery.cfg",
+                    "[VERSION]\nmajor=1\nminor=0\n",
+                )
+
+            install_livery(ptp_path, package)
+
+            self.assertTrue(
+                (
+                    package
+                    / "SimObjects"
+                    / "Airplanes"
+                    / "PMDG 737-800"
+                    / "liveries"
+                    / "pmdg"
+                    / "PTP Livery"
+                    / "livery.cfg"
+                ).exists()
+            )
+
+    def test_installs_zip_containing_ptp(self) -> None:
+        with workspace_root() as root:
+            package = make_package(root)
+            ptp_path = root / "inner.ptp"
+            with zipfile.ZipFile(ptp_path, "w") as archive:
+                archive.writestr(
+                    "SimObjects/Airplanes/PMDG 737-800/liveries/pmdg/Nested PTP/livery.cfg",
+                    "[VERSION]\nmajor=1\nminor=0\n",
+                )
+
+            outer_zip = root / "download.zip"
+            with zipfile.ZipFile(outer_zip, "w") as archive:
+                archive.write(ptp_path, "downloaded/inner.ptp")
+
+            install_livery(outer_zip, package)
+
+            self.assertTrue(
+                (
+                    package
+                    / "SimObjects"
+                    / "Airplanes"
+                    / "PMDG 737-800"
+                    / "liveries"
+                    / "pmdg"
+                    / "Nested PTP"
+                    / "livery.cfg"
+                ).exists()
+            )
+
     def test_installs_direct_livery_folder(self) -> None:
         with workspace_root() as root:
             package = make_package(root)
