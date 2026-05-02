@@ -128,14 +128,14 @@ def launch_gui() -> None:
     def label(parent, text, size=10, color="#e8edf2", weight="normal"):
         return tk.Label(parent, text=text, bg=parent["bg"], fg=color, font=("Segoe UI", size, weight), anchor="w")
 
-    top = tk.Frame(root, bg="#080b0f", height=82)
+    top = tk.Frame(root, bg="#080b0f", height=96)
     top.pack(fill=tk.X)
     top.pack_propagate(False)
-    tk.Label(top, text="PMDG", bg="#b51f2c", fg="#ffffff", font=("Segoe UI", 13, "bold"), width=7, pady=8).pack(side=tk.LEFT, padx=22, pady=18)
+    tk.Label(top, text="PMDG", bg="#b51f2c", fg="#ffffff", font=("Segoe UI", 13, "bold"), width=7, pady=10).pack(side=tk.LEFT, padx=22, pady=20)
     title_box = tk.Frame(top, bg="#080b0f")
     title_box.pack(side=tk.LEFT)
-    label(title_box, SETUP_TITLE, 15, "#ffffff", "bold").pack(anchor="w")
-    label(title_box, "Install the standalone MSFS 2024 PMDG livery manager.", 9, "#9aa7b3").pack(anchor="w")
+    label(title_box, SETUP_TITLE, 14, "#ffffff", "bold").pack(anchor="w")
+    label(title_box, "Install the standalone MSFS 2024 PMDG livery manager.", 9, "#9aa7b3").pack(anchor="w", pady=(4, 0))
     tk.Frame(root, bg="#b51f2c", height=3).pack(fill=tk.X)
 
     body = tk.Frame(root, bg="#121922", padx=22, pady=22)

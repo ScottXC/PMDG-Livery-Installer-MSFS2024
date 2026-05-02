@@ -786,12 +786,12 @@ def launch_gui() -> None:
                 padding=8,
             )
 
-            topbar = tk.Frame(self, bg=self.color("top"), height=82)
+            topbar = tk.Frame(self, bg=self.color("top"), height=104)
             topbar.pack(fill=tk.X)
             topbar.pack_propagate(False)
 
             brand = tk.Frame(topbar, bg=self.color("top"))
-            brand.pack(side=tk.LEFT, padx=22, pady=14)
+            brand.pack(side=tk.LEFT, padx=22, pady=18)
             tk.Label(
                 brand,
                 text="PMDG",
@@ -799,7 +799,7 @@ def launch_gui() -> None:
                 fg="#ffffff",
                 font=("Segoe UI", 13, "bold"),
                 width=7,
-                pady=8,
+                pady=10,
             ).pack(side=tk.LEFT)
             title_box = tk.Frame(brand, bg=self.color("top"))
             title_box.pack(side=tk.LEFT, padx=(14, 0))
@@ -808,7 +808,7 @@ def launch_gui() -> None:
                 text="PMDG Livery Installer MSFS2024",
                 bg=self.color("top"),
                 fg="#ffffff",
-                font=("Segoe UI", 16, "bold"),
+                font=("Segoe UI", 15, "bold"),
                 anchor="w",
             ).pack(anchor="w")
             tk.Label(
@@ -818,7 +818,7 @@ def launch_gui() -> None:
                 fg=self.color("muted"),
                 font=("Segoe UI", 9),
                 anchor="w",
-            ).pack(anchor="w")
+            ).pack(anchor="w", pady=(4, 0))
             tk.Label(
                 topbar,
                 textvariable=self.status_var,
