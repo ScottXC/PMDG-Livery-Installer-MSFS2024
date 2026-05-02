@@ -39,6 +39,7 @@ class InstallerError(RuntimeError):
 @dataclass
 class InstallReport:
     package_root: Path
+    source_package_root: Path | None = None
     copied_files: int = 0
     copied_dirs: int = 0
     layout_entries: int = 0
@@ -135,7 +136,7 @@ def find_pmdg_packages(community_path: Path) -> list[Path]:
         if not child.is_dir():
             continue
         name = child.name.lower()
-        if not name.startswith("pmdg-aircraft"):
+        if not name.startswith("pmdg-aircraft") or name.endswith("-liveries"):
             continue
         if (child / "layout.json").exists() and (child / "SimObjects").exists():
             packages.append(child)
@@ -152,6 +153,46 @@ def validate_package_root(package_root: Path) -> Path:
     if not (package_root / "SimObjects").exists():
         raise InstallerError(f"SimObjects folder not found in PMDG package: {package_root}")
     return package_root
+
+
+def ensure_livery_package_root(selected_package_root: Path) -> Path:
+    selected_package_root = validate_package_root(selected_package_root)
+    if selected_package_root.name.lower().endswith("-liveries"):
+        return selected_package_root
+    return selected_package_root.parent / f"{selected_package_root.name}-liveries"
+
+
+def ensure_livery_package_skeleton(livery_package_root: Path, selected_package_root: Path) -> None:
+    livery_package_root.mkdir(parents=True, exist_ok=True)
+    (livery_package_root / "SimObjects" / "Airplanes").mkdir(parents=True, exist_ok=True)
+    layout_path = livery_package_root / "layout.json"
+    if not layout_path.exists():
+        layout_path.write_text('{"content":[]}\n', encoding="utf-8")
+    manifest_path = livery_package_root / "manifest.json"
+    if not manifest_path.exists():
+        manifest = {
+            "dependencies": [],
+            "content_type": "AIRCRAFT",
+            "title": "Liveries",
+            "manufacturer": "PMDG",
+            "creator": "PMDG Livery Installer MSFS2024",
+            "package_version": "1.0.0",
+            "minimum_game_version": "1.20.6",
+            "release_notes": {"neutral": {"LastUpdate": "", "OlderHistory": ""}},
+            "total_package_size": "0",
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def find_livery_package_roots(source_root: Path) -> list[Path]:
+    roots: list[Path] = []
+    for directory in iter_dirs(source_root):
+        name = directory.name.lower()
+        if name.startswith("pmdg-aircraft") and name.endswith("-liveries"):
+            simobjects = directory / "SimObjects" / "Airplanes"
+            if simobjects.exists() and simobjects.is_dir():
+                roots.append(directory)
+    return sorted(roots, key=lambda p: len(p.parts))
 
 
 def safe_extract_archive(archive_path: Path, target_dir: Path) -> None:
@@ -317,6 +358,17 @@ def get_single_airplane_folder(package_root: Path) -> Path:
     )
 
 
+def get_airplane_folder_name(selected_package_root: Path, livery_package_root: Path) -> str:
+    livery_airplanes = livery_package_root / "SimObjects" / "Airplanes"
+    if livery_airplanes.exists():
+        livery_folders = [p for p in livery_airplanes.iterdir() if p.is_dir()]
+        if len(livery_folders) == 1:
+            return livery_folders[0].name
+
+    selected_airplane = get_single_airplane_folder(selected_package_root)
+    return selected_airplane.name
+
+
 def should_skip_root_item(path: Path) -> bool:
     lower_name = path.name.lower()
     if lower_name in ROOT_EXCLUDE_NAMES:
@@ -376,13 +428,45 @@ def copy_package_contents(source_root: Path, package_root: Path, overwrite: bool
     return copied_files, copied_dirs, installed_roots
 
 
-def copy_direct_liveries(
-    livery_folders: list[Path],
-    package_root: Path,
+def copy_livery_package_contents(
+    source_package_root: Path,
+    livery_package_root: Path,
     overwrite: bool,
 ) -> tuple[int, int, list[Path]]:
-    airplane_folder = get_single_airplane_folder(package_root)
-    livery_target = airplane_folder / "liveries" / "pmdg"
+    copied_files = 0
+    copied_dirs = 0
+    installed_roots: list[Path] = []
+
+    for item in source_package_root.iterdir():
+        lower_name = item.name.lower()
+        if lower_name in {"layout.json", "msfslayoutgenerator.exe"} or lower_name.startswith("layout.json.bak-"):
+            continue
+        if lower_name == "manifest.json" and (livery_package_root / "manifest.json").exists() and not overwrite:
+            continue
+        dest = livery_package_root / item.name
+        files, dirs = copy_path(item, dest, overwrite=overwrite)
+        copied_files += files
+        copied_dirs += dirs
+        installed_roots.append(dest)
+
+    return copied_files, copied_dirs, installed_roots
+
+
+def copy_direct_liveries(
+    livery_folders: list[Path],
+    selected_package_root: Path,
+    livery_package_root: Path,
+    overwrite: bool,
+) -> tuple[int, int, list[Path]]:
+    airplane_folder_name = get_airplane_folder_name(selected_package_root, livery_package_root)
+    livery_target = (
+        livery_package_root
+        / "SimObjects"
+        / "Airplanes"
+        / airplane_folder_name
+        / "liveries"
+        / "pmdg"
+    )
     livery_target.mkdir(parents=True, exist_ok=True)
 
     copied_files = 0
@@ -484,39 +568,55 @@ def install_livery(
     overwrite: bool = False,
     backup_layout: bool = True,
 ) -> InstallReport:
-    package_root = validate_package_root(package_root)
+    selected_package_root = validate_package_root(package_root)
+    livery_package_root = ensure_livery_package_root(selected_package_root)
 
-    with temporary_workspace(package_root) as tmp:
+    with temporary_workspace(livery_package_root) as tmp:
         source_root = source_root_from_input(livery_input, tmp)
 
-        simobjects_roots = find_simobjects_roots(source_root)
-        if simobjects_roots:
-            copy_root = simobjects_roots[0]
-            copied_files, copied_dirs, installed_roots = copy_package_contents(
-                copy_root,
-                package_root,
+        livery_package_roots = find_livery_package_roots(source_root)
+        if livery_package_roots:
+            source_package_root = livery_package_roots[0]
+            livery_package_root.mkdir(parents=True, exist_ok=True)
+            copied_files, copied_dirs, installed_roots = copy_livery_package_contents(
+                source_package_root,
+                livery_package_root,
                 overwrite=overwrite,
             )
+            ensure_livery_package_skeleton(livery_package_root, selected_package_root)
         else:
-            livery_folders = find_direct_livery_folders(source_root)
-            if not livery_folders:
-                raise InstallerError(
-                    "No installable livery structure found. Expected a SimObjects "
-                    "folder, a ZIP-based PTP package, or a livery folder containing "
-                    "livery.cfg/texture/model/panel."
+            source_package_root = None
+            ensure_livery_package_skeleton(livery_package_root, selected_package_root)
+            simobjects_roots = find_simobjects_roots(source_root)
+            if simobjects_roots:
+                copy_root = simobjects_roots[0]
+                copied_files, copied_dirs, installed_roots = copy_package_contents(
+                    copy_root,
+                    livery_package_root,
+                    overwrite=overwrite,
                 )
-            copied_files, copied_dirs, installed_roots = copy_direct_liveries(
-                livery_folders,
-                package_root,
-                overwrite=overwrite,
-            )
+            else:
+                livery_folders = find_direct_livery_folders(source_root)
+                if not livery_folders:
+                    raise InstallerError(
+                        "No installable livery structure found. Expected a PMDG "
+                        "*-liveries package, a SimObjects folder, a ZIP-based PTP "
+                        "package, or a livery folder containing livery.cfg/texture/model/panel."
+                    )
+                copied_files, copied_dirs, installed_roots = copy_direct_liveries(
+                    livery_folders,
+                    selected_package_root,
+                    livery_package_root,
+                    overwrite=overwrite,
+                )
 
     layout_entries, manifest_updated, backup_path = rebuild_layout(
-        package_root,
+        livery_package_root,
         backup=backup_layout,
     )
     return InstallReport(
-        package_root=package_root,
+        package_root=livery_package_root,
+        source_package_root=source_package_root,
         copied_files=copied_files,
         copied_dirs=copied_dirs,
         layout_entries=layout_entries,
@@ -528,12 +628,14 @@ def install_livery(
 
 def format_report(report: InstallReport) -> str:
     lines = [
-        f"Package: {report.package_root}",
+        f"Livery package: {report.package_root}",
         f"Copied files: {report.copied_files}",
         f"Copied folders: {report.copied_dirs}",
         f"layout.json entries: {report.layout_entries}",
         f"manifest.json updated: {'yes' if report.manifest_updated else 'no'}",
     ]
+    if report.source_package_root:
+        lines.append(f"Source package: {report.source_package_root}")
     if report.backup_path:
         lines.append(f"layout backup: {report.backup_path}")
     if report.installed_roots:

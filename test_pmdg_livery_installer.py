@@ -22,6 +22,10 @@ def make_package(root: Path) -> Path:
     return package
 
 
+def livery_package_for(package: Path) -> Path:
+    return package.parent / f"{package.name}-liveries"
+
+
 @contextmanager
 def workspace_root():
     root = Path.cwd() / f".test_workspace_{uuid.uuid4().hex}"
@@ -46,9 +50,10 @@ class InstallerTests(unittest.TestCase):
                 archive.writestr("release/MSFSLayoutGenerator.exe", "not copied")
 
             report = install_livery(zip_path, package)
+            livery_package = livery_package_for(package)
 
             installed = (
-                package
+                livery_package
                 / "SimObjects"
                 / "Airplanes"
                 / "PMDG 737-800"
@@ -58,19 +63,54 @@ class InstallerTests(unittest.TestCase):
                 / "livery.cfg"
             )
             self.assertTrue(installed.exists())
-            self.assertFalse((package / "MSFSLayoutGenerator.exe").exists())
-            self.assertNotIn("download wrapper", (package / "manifest.json").read_text(encoding="utf-8"))
+            self.assertFalse((livery_package / "MSFSLayoutGenerator.exe").exists())
+            self.assertNotIn("download wrapper", (livery_package / "manifest.json").read_text(encoding="utf-8"))
             self.assertGreater(report.layout_entries, 0)
 
-            layout = json.loads((package / "layout.json").read_text(encoding="utf-8"))
+            layout = json.loads((livery_package / "layout.json").read_text(encoding="utf-8"))
             paths = {entry["path"] for entry in layout["content"]}
             self.assertIn(
                 "SimObjects/Airplanes/PMDG 737-800/liveries/pmdg/Test Livery/livery.cfg",
                 paths,
             )
 
-            manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
+            manifest = json.loads((livery_package / "manifest.json").read_text(encoding="utf-8"))
             self.assertNotEqual(manifest["total_package_size"], "0")
+
+    def test_installs_full_liveries_package_to_sibling_package(self) -> None:
+        with workspace_root() as root:
+            package = make_package(root)
+            zip_path = root / "full-package.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr(
+                    "pmdg-aircraft-738-liveries/manifest.json",
+                    json.dumps({"title": "Liveries", "creator": "Source Author", "total_package_size": "0"}),
+                )
+                archive.writestr("pmdg-aircraft-738-liveries/layout.json", '{"content":[]}')
+                archive.writestr("pmdg-aircraft-738-liveries/MSFSLayoutGenerator.exe", "not copied")
+                archive.writestr(
+                    "pmdg-aircraft-738-liveries/SimObjects/Airplanes/PMDG 737-800/liveries/pmdg/Full Package/livery.cfg",
+                    "[VERSION]\nmajor=1\nminor=0\n",
+                )
+
+            install_livery(zip_path, package)
+            livery_package = livery_package_for(package)
+
+            self.assertTrue(
+                (
+                    livery_package
+                    / "SimObjects"
+                    / "Airplanes"
+                    / "PMDG 737-800"
+                    / "liveries"
+                    / "pmdg"
+                    / "Full Package"
+                    / "livery.cfg"
+                ).exists()
+            )
+            self.assertFalse((livery_package / "MSFSLayoutGenerator.exe").exists())
+            manifest = json.loads((livery_package / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["creator"], "Source Author")
 
     def test_installs_zip_based_ptp(self) -> None:
         with workspace_root() as root:
@@ -83,10 +123,11 @@ class InstallerTests(unittest.TestCase):
                 )
 
             install_livery(ptp_path, package)
+            livery_package = livery_package_for(package)
 
             self.assertTrue(
                 (
-                    package
+                    livery_package
                     / "SimObjects"
                     / "Airplanes"
                     / "PMDG 737-800"
@@ -112,10 +153,11 @@ class InstallerTests(unittest.TestCase):
                 archive.write(ptp_path, "downloaded/inner.ptp")
 
             install_livery(outer_zip, package)
+            livery_package = livery_package_for(package)
 
             self.assertTrue(
                 (
-                    package
+                    livery_package
                     / "SimObjects"
                     / "Airplanes"
                     / "PMDG 737-800"
@@ -135,10 +177,11 @@ class InstallerTests(unittest.TestCase):
             (livery / "texture.TEST" / "texture.cfg").write_text("[fltsim]\n", encoding="utf-8")
 
             install_livery(livery, package)
+            livery_package = livery_package_for(package)
 
             self.assertTrue(
                 (
-                    package
+                    livery_package
                     / "SimObjects"
                     / "Airplanes"
                     / "PMDG 737-800"
