@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='PMDG Livery Installer MSFS2024 Setup v0.1.4',
+    name='PMDG Livery Installer MSFS2024 Setup v0.1.2',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
