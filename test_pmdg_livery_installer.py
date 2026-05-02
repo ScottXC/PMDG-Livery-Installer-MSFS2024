@@ -6,7 +6,7 @@ import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from pmdg_livery_installer import install_livery
+from pmdg_livery_installer import InstallerError, install_livery
 
 
 def make_package(root: Path) -> Path:
@@ -111,6 +111,21 @@ class InstallerTests(unittest.TestCase):
             self.assertFalse((livery_package / "MSFSLayoutGenerator.exe").exists())
             manifest = json.loads((livery_package / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["creator"], "Source Author")
+
+    def test_rejects_mismatched_liveries_package(self) -> None:
+        with workspace_root() as root:
+            package = make_package(root)
+            zip_path = root / "wrong-package.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("pmdg-aircraft-77w-liveries/manifest.json", "{}")
+                archive.writestr("pmdg-aircraft-77w-liveries/layout.json", '{"content":[]}')
+                archive.writestr(
+                    "pmdg-aircraft-77w-liveries/SimObjects/Airplanes/PMDG 777-300ER/liveries/pmdg/Wrong/livery.cfg",
+                    "[VERSION]\nmajor=1\nminor=0\n",
+                )
+
+            with self.assertRaises(InstallerError):
+                install_livery(zip_path, package)
 
     def test_installs_zip_based_ptp(self) -> None:
         with workspace_root() as root:

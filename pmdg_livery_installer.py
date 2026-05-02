@@ -577,6 +577,11 @@ def install_livery(
         livery_package_roots = find_livery_package_roots(source_root)
         if livery_package_roots:
             source_package_root = livery_package_roots[0]
+            if source_package_root.name.lower() != livery_package_root.name.lower():
+                raise InstallerError(
+                    "The livery package does not match the selected aircraft package. "
+                    f"Source is {source_package_root.name}, target is {livery_package_root.name}."
+                )
             livery_package_root.mkdir(parents=True, exist_ok=True)
             copied_files, copied_dirs, installed_roots = copy_livery_package_contents(
                 source_package_root,
