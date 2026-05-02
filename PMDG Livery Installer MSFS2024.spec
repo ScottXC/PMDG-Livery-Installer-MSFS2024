@@ -5,7 +5,7 @@ a = Analysis(
     ['pmdg_livery_installer.py'],
     pathex=[],
     binaries=[],
-    datas=[('.\\assets\\pmdg_livery_installer_icon.ico', 'assets')],
+    datas=[('.\\assets\\pmdg_livery_installer_icon.ico', 'assets'), ('.\\assets\\MSFSLayoutGenerator.exe', 'assets')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

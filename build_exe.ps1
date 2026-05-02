@@ -14,6 +14,7 @@ python .\tools\run_pyinstaller_fixed_temp.py `
   --name "PMDG Livery Installer MSFS2024" `
   --icon ".\assets\pmdg_livery_installer_icon.ico" `
   --add-data ".\assets\pmdg_livery_installer_icon.ico;assets" `
+  --add-data ".\assets\MSFSLayoutGenerator.exe;assets" `
   .\pmdg_livery_installer.py
 
 Write-Host ""

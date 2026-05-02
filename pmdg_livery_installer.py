@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -546,20 +547,44 @@ def rebuild_layout(package_root: Path, backup: bool = True) -> tuple[int, bool, 
         backup_path = package_root / f"layout.json.bak-{timestamp}"
         shutil.copy2(layout_path, backup_path)
 
-    content = build_layout_content(package_root)
-    total_size = sum(int(item["size"]) for item in content)
-    manifest_updated = update_manifest_size(package_root, total_size)
+    stale_generator = package_root / "MSFSLayoutGenerator.exe"
+    if stale_generator.exists():
+        stale_generator.unlink()
 
-    if manifest_updated:
-        content = build_layout_content(package_root)
+    generator_path = layout_generator_path()
+    try:
+        subprocess.run(
+            [str(generator_path), str(layout_path)],
+            cwd=str(package_root),
+            check=True,
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        if detail:
+            raise InstallerError(f"MSFSLayoutGenerator failed: {detail}") from exc
+        raise InstallerError(f"MSFSLayoutGenerator failed with exit code {exc.returncode}") from exc
 
-    tmp_path = package_root / "layout.json.tmp"
-    tmp_path.write_text(
-        json.dumps({"content": content}, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    tmp_path.replace(layout_path)
-    return len(content), manifest_updated, backup_path
+    try:
+        data = json.loads(layout_path.read_text(encoding="utf-8-sig"))
+        content = data.get("content", [])
+        entry_count = len(content) if isinstance(content, list) else 0
+    except (OSError, json.JSONDecodeError):
+        entry_count = 0
+    return entry_count, False, backup_path
+
+
+def layout_generator_path() -> Path:
+    override = os.environ.get("PMDG_LAYOUT_GENERATOR")
+    if override:
+        path = normalize_path(override)
+    else:
+        path = app_resource_path("assets/MSFSLayoutGenerator.exe")
+    if not path.exists():
+        raise InstallerError("Bundled MSFSLayoutGenerator.exe was not found.")
+    return path
 
 
 def install_livery(
