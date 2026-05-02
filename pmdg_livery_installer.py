@@ -27,6 +27,7 @@ from typing import Iterable
 WINDOWS_FILETIME_EPOCH_OFFSET = 11644473600
 ROOT_EXCLUDE_NAMES = {
     "layout.json",
+    "manifest.json",
     "msfslayoutgenerator.exe",
 }
 

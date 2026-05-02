@@ -38,6 +38,7 @@ class InstallerTests(unittest.TestCase):
             package = make_package(root)
             zip_path = root / "livery.zip"
             with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("release/manifest.json", '{"title":"download wrapper"}')
                 archive.writestr(
                     "release/SimObjects/Airplanes/PMDG 737-800/liveries/pmdg/Test Livery/livery.cfg",
                     "[VERSION]\nmajor=1\nminor=0\n",
@@ -58,6 +59,7 @@ class InstallerTests(unittest.TestCase):
             )
             self.assertTrue(installed.exists())
             self.assertFalse((package / "MSFSLayoutGenerator.exe").exists())
+            self.assertNotIn("download wrapper", (package / "manifest.json").read_text(encoding="utf-8"))
             self.assertGreater(report.layout_entries, 0)
 
             layout = json.loads((package / "layout.json").read_text(encoding="utf-8"))

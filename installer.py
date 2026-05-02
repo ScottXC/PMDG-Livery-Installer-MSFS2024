@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 APP_NAME = "PMDG Livery Installer MSFS2024"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 APP_EXE_NAME = f"{APP_NAME}.exe"
 SETUP_TITLE = f"{APP_NAME} Setup v{VERSION}"
 
