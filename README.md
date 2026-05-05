@@ -69,6 +69,21 @@ Community\pmdg-aircraft-77w-liveries\SimObjects\Airplanes\PMDG 777-300ER\liverie
 
 It then runs the bundled `MSFSLayoutGenerator.exe` against that livery package `layout.json`, replacing the manual drag-to-layout-generator step.
 
+## Uninstall
+
+The installer writes a user-level uninstaller. You can remove the application from:
+
+- Windows Settings > Apps.
+- Start Menu > PMDG Livery Installer MSFS2024 > Uninstall.
+- The setup window, using `Uninstall Existing` when an installed copy is detected.
+- Command line:
+
+```powershell
+"%LOCALAPPDATA%\Programs\PMDG Livery Installer MSFS2024\Uninstall.cmd" /S
+```
+
+The uninstaller removes the installed app folder, Start Menu shortcuts, desktop shortcut, saved settings, and the Windows uninstall entry. It does not remove liveries already installed into MSFS Community packages.
+
 ## Command Line
 
 Detect paths:
