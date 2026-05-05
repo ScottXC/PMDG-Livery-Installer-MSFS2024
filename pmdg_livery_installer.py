@@ -2,7 +2,7 @@
 """
 PMDG Livery Installer for MSFS 2024.
 
-Installs MSFS 2024 PMDG livery ZIP/PTP/folder packages without PMDG OC3 by
+Installs MSFS 2024 PMDG livery ZIP/folder packages without PMDG OC3 by
 copying the livery files into an existing PMDG aircraft package and rebuilding
 layout.json.
 """
@@ -293,44 +293,11 @@ def safe_extract_archive(archive_path: Path, target_dir: Path) -> None:
                 with archive.open(item) as source, destination.open("wb") as dest:
                     shutil.copyfileobj(source, dest)
     except zipfile.BadZipFile as exc:
-        if archive_path.suffix.lower() == ".ptp":
-            raise InstallerError(
-                "This .ptp file is not a readable archive. Only ZIP-based PMDG "
-                "PTP packages can be installed directly."
-            ) from exc
         raise InstallerError(f"Not a valid ZIP file: {archive_path}") from exc
 
 
 def contains_installable_content(root: Path) -> bool:
     return bool(find_simobjects_roots(root) or find_direct_livery_folders(root))
-
-
-def extract_nested_ptp_files(root: Path, temp_dir: Path) -> Path:
-    if contains_installable_content(root):
-        return root
-
-    ptp_files = sorted(root.rglob("*.ptp"), key=lambda p: len(p.parts))
-    if not ptp_files:
-        return root
-
-    nested_root = temp_dir / "nested_ptp"
-    nested_root.mkdir(parents=True, exist_ok=True)
-    extracted_any = False
-    errors: list[str] = []
-    for ptp_file in ptp_files:
-        target = nested_root / ptp_file.stem
-        target.mkdir(parents=True, exist_ok=True)
-        try:
-            safe_extract_archive(ptp_file, target)
-            extracted_any = True
-        except InstallerError as exc:
-            errors.append(f"{ptp_file.name}: {exc}")
-
-    if extracted_any:
-        return nested_root
-    if errors:
-        raise InstallerError("; ".join(errors))
-    return root
 
 
 def source_root_from_input(input_path: Path, temp_dir: Path) -> Path:
@@ -339,12 +306,12 @@ def source_root_from_input(input_path: Path, temp_dir: Path) -> Path:
         raise InstallerError(f"Livery path does not exist: {input_path}")
 
     if input_path.is_file():
-        if input_path.suffix.lower() not in {".zip", ".ptp"}:
-            raise InstallerError("Only .zip/.ptp files or extracted livery folders are supported.")
+        if input_path.suffix.lower() != ".zip":
+            raise InstallerError("Only .zip files or extracted livery folders are supported. .ptp import is not supported.")
         extract_root = temp_dir / safe_name(input_path.stem)
         extract_root.mkdir(parents=True, exist_ok=True)
         safe_extract_archive(input_path, extract_root)
-        return extract_nested_ptp_files(extract_root, temp_dir)
+        return extract_root
 
     return input_path
 
@@ -764,8 +731,8 @@ def install_livery(
                 if not livery_folders:
                     raise InstallerError(
                         "No installable livery structure found. Expected a PMDG "
-                        "*-liveries package, a SimObjects folder, a ZIP-based PTP "
-                        "package, or a livery folder containing livery.cfg/texture/model/panel."
+                        "*-liveries package, a SimObjects folder, or a livery folder "
+                        "containing livery.cfg/texture/model/panel."
                     )
                 copied_files, copied_dirs, installed_roots = copy_direct_liveries(
                     livery_folders,
@@ -1195,7 +1162,7 @@ def launch_gui() -> None:
             self.package_combo.grid(row=1, column=0, sticky="ew", padx=(0, 8), ipady=4)
             self.button(package, "Refresh", self.refresh_packages).grid(row=1, column=1)
 
-            install_card, install = self.card(content, "Livery Package", "Select a ZIP, PTP, or extracted livery folder.")
+            install_card, install = self.card(content, "Livery Package", "Select a ZIP or extracted livery folder.")
             install_card.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 14))
             install.columnconfigure(1, weight=1)
             self.label(install, "Source", 9, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(0, 12))
@@ -1571,8 +1538,8 @@ def launch_gui() -> None:
 
         def choose_zip(self) -> None:
             path = filedialog.askopenfilename(
-                title="Select livery ZIP or PTP",
-                filetypes=[("PMDG livery packages", "*.zip *.ptp"), ("ZIP files", "*.zip"), ("PTP files", "*.ptp"), ("All files", "*.*")],
+                title="Select livery ZIP",
+                filetypes=[("ZIP files", "*.zip"), ("All files", "*.*")],
             )
             if path:
                 self.livery_var.set(path)

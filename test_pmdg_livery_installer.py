@@ -193,39 +193,26 @@ class InstallerTests(unittest.TestCase):
                 with self.assertRaises(InstallerError):
                     install_livery(livery, package)
 
-    def test_installs_zip_based_ptp(self) -> None:
+    def test_rejects_ptp_file(self) -> None:
         with workspace_root() as root:
             package = make_package(root)
             ptp_path = root / "livery.ptp"
             with zipfile.ZipFile(ptp_path, "w") as archive:
                 archive.writestr(
-                    "SimObjects/Airplanes/PMDG 737-800/liveries/pmdg/PTP Livery/livery.cfg",
+                    "SimObjects/Airplanes/PMDG 737-800/liveries/pmdg/Unsupported PTP/livery.cfg",
                     "[VERSION]\nmajor=1\nminor=0\n",
                 )
 
-            install_livery(ptp_path, package)
-            livery_package = livery_package_for(package)
+            with self.assertRaises(InstallerError):
+                install_livery(ptp_path, package)
 
-            self.assertTrue(
-                (
-                    livery_package
-                    / "SimObjects"
-                    / "Airplanes"
-                    / "PMDG 737-800"
-                    / "liveries"
-                    / "pmdg"
-                    / "PTP Livery"
-                    / "livery.cfg"
-                ).exists()
-            )
-
-    def test_installs_zip_containing_ptp(self) -> None:
+    def test_zip_containing_only_ptp_is_not_supported(self) -> None:
         with workspace_root() as root:
             package = make_package(root)
             ptp_path = root / "inner.ptp"
             with zipfile.ZipFile(ptp_path, "w") as archive:
                 archive.writestr(
-                    "SimObjects/Airplanes/PMDG 737-800/liveries/pmdg/Nested PTP/livery.cfg",
+                    "SimObjects/Airplanes/PMDG 737-800/liveries/pmdg/Nested Unsupported PTP/livery.cfg",
                     "[VERSION]\nmajor=1\nminor=0\n",
                 )
 
@@ -233,21 +220,8 @@ class InstallerTests(unittest.TestCase):
             with zipfile.ZipFile(outer_zip, "w") as archive:
                 archive.write(ptp_path, "downloaded/inner.ptp")
 
-            install_livery(outer_zip, package)
-            livery_package = livery_package_for(package)
-
-            self.assertTrue(
-                (
-                    livery_package
-                    / "SimObjects"
-                    / "Airplanes"
-                    / "PMDG 737-800"
-                    / "liveries"
-                    / "pmdg"
-                    / "Nested PTP"
-                    / "livery.cfg"
-                ).exists()
-            )
+            with self.assertRaises(InstallerError):
+                install_livery(outer_zip, package)
 
     def test_installs_direct_livery_folder(self) -> None:
         with workspace_root() as root:
