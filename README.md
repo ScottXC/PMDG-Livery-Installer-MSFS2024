@@ -42,7 +42,7 @@ This tool does not convert MSFS 2020 liveries. Proprietary or damaged PTP files 
 Download the installer from the GitHub Releases page and run:
 
 ```text
-PMDG Livery Installer MSFS2024 Setup v0.1.2.exe
+PMDG Livery Installer MSFS2024 Setup v0.1.3.exe
 ```
 
 Portable executable builds are also available in:
@@ -129,7 +129,7 @@ PMDG Livery Installer MSFS2024 用于管理 MSFS 2024 中兼容的 PMDG 机模�
 从 GitHub Releases 下载安装包并运行：
 
 ```text
-PMDG Livery Installer MSFS2024 Setup v0.1.2.exe
+PMDG Livery Installer MSFS2024 Setup v0.1.3.exe
 ```
 
 便携版可执行文件也位于：

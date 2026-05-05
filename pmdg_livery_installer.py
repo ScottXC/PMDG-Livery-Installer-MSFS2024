@@ -32,6 +32,14 @@ ROOT_EXCLUDE_NAMES = {
     "msfslayoutgenerator.exe",
 }
 
+KNOWN_PMDG_AIRCRAFT_FOLDERS = {
+    "pmdg-aircraft-736": "PMDG 737-600",
+    "pmdg-aircraft-737": "PMDG 737-700",
+    "pmdg-aircraft-738": "PMDG 737-800",
+    "pmdg-aircraft-739": "PMDG 737-900",
+    "pmdg-aircraft-77w": "PMDG 777-300ER",
+}
+
 
 class InstallerError(RuntimeError):
     """Raised for user-fixable installer failures."""
@@ -145,6 +153,45 @@ def find_pmdg_packages(community_path: Path) -> list[Path]:
     return sorted(packages, key=lambda p: p.name.lower())
 
 
+def base_package_name(package_name: str) -> str:
+    package_name = package_name.lower()
+    if package_name.endswith("-liveries"):
+        return package_name[: -len("-liveries")]
+    return package_name
+
+
+def known_airplane_folder_name(package_root: Path) -> str | None:
+    return KNOWN_PMDG_AIRCRAFT_FOLDERS.get(base_package_name(package_root.name))
+
+
+def find_pmdg_product_roots(community_path: Path, wasm_path: Path | None = None) -> list[Path]:
+    community_path = normalize_path(community_path)
+    product_roots: dict[str, Path] = {}
+
+    for package in find_pmdg_packages(community_path):
+        product_roots[package.name.lower()] = package
+
+    if community_path.exists():
+        for child in community_path.iterdir():
+            if not child.is_dir():
+                continue
+            base_name = base_package_name(child.name)
+            if base_name in KNOWN_PMDG_AIRCRAFT_FOLDERS:
+                product_roots.setdefault(base_name, community_path / base_name)
+
+    if wasm_path:
+        wasm_path = normalize_path(wasm_path)
+        if wasm_path.exists():
+            for child in wasm_path.iterdir():
+                if not child.is_dir():
+                    continue
+                base_name = base_package_name(child.name)
+                if base_name in KNOWN_PMDG_AIRCRAFT_FOLDERS:
+                    product_roots.setdefault(base_name, community_path / base_name)
+
+    return sorted(product_roots.values(), key=lambda p: p.name.lower())
+
+
 def validate_package_root(package_root: Path) -> Path:
     package_root = normalize_path(package_root)
     if not package_root.exists() or not package_root.is_dir():
@@ -156,8 +203,17 @@ def validate_package_root(package_root: Path) -> Path:
     return package_root
 
 
+def validate_selected_package_root(package_root: Path) -> Path:
+    package_root = normalize_path(package_root)
+    if package_root.exists():
+        return validate_package_root(package_root)
+    if known_airplane_folder_name(package_root) and package_root.parent.exists():
+        return package_root
+    raise InstallerError(f"PMDG package folder does not exist: {package_root}")
+
+
 def ensure_livery_package_root(selected_package_root: Path) -> Path:
-    selected_package_root = validate_package_root(selected_package_root)
+    selected_package_root = validate_selected_package_root(selected_package_root)
     if selected_package_root.name.lower().endswith("-liveries"):
         return selected_package_root
     return selected_package_root.parent / f"{selected_package_root.name}-liveries"
@@ -365,6 +421,10 @@ def get_airplane_folder_name(selected_package_root: Path, livery_package_root: P
         livery_folders = [p for p in livery_airplanes.iterdir() if p.is_dir()]
         if len(livery_folders) == 1:
             return livery_folders[0].name
+
+    known_folder = known_airplane_folder_name(selected_package_root)
+    if known_folder:
+        return known_folder
 
     selected_airplane = get_single_airplane_folder(selected_package_root)
     return selected_airplane.name
@@ -593,7 +653,7 @@ def install_livery(
     overwrite: bool = False,
     backup_layout: bool = True,
 ) -> InstallReport:
-    selected_package_root = validate_package_root(package_root)
+    selected_package_root = validate_selected_package_root(package_root)
     livery_package_root = ensure_livery_package_root(selected_package_root)
 
     with temporary_workspace(livery_package_root) as tmp:
@@ -1209,7 +1269,21 @@ def launch_gui() -> None:
             return None
 
         def describe_package(self, package_root: Path) -> str:
-            lines = [f"Package: {package_root}", ""]
+            known_folder = known_airplane_folder_name(package_root)
+            lines = [f"Package: {package_root}"]
+            if known_folder:
+                lines.append(f"Aircraft: {known_folder}")
+            if not package_root.exists():
+                livery_root = ensure_livery_package_root(package_root)
+                lines.extend(
+                    [
+                        "Status: aircraft package not found in Community",
+                        f"Livery target: {livery_root}",
+                        "",
+                    ]
+                )
+            else:
+                lines.append("")
             manifest_path = package_root / "manifest.json"
             if manifest_path.exists():
                 try:
@@ -1382,11 +1456,14 @@ def launch_gui() -> None:
                 self.package_count_var.set("0 products detected")
                 self.status_var.set("Select a Community folder")
                 return
-            packages = find_pmdg_packages(Path(community))
+            wasm = Path(self.wasm_var.get().strip()) if self.wasm_var.get().strip() else None
+            packages = find_pmdg_product_roots(Path(community), wasm)
             self.detected_packages = packages
             values = []
             for package in packages:
-                label = f"{package.name}    ({package})"
+                aircraft = known_airplane_folder_name(package)
+                label_name = f"{aircraft} - {package.name}" if aircraft else package.name
+                label = f"{label_name}    ({package})"
                 self.package_paths[label] = package
                 values.append(label)
             self.package_combo["values"] = values
@@ -1480,13 +1557,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def resolve_package_from_args(args: argparse.Namespace) -> Path:
     if args.package_root:
-        return validate_package_root(args.package_root)
+        return validate_selected_package_root(args.package_root)
 
     if not args.community or not args.package:
         raise InstallerError("Use --package-root, or use --community with --package.")
 
     package_root = normalize_path(args.community) / args.package
-    return validate_package_root(package_root)
+    return validate_selected_package_root(package_root)
 
 
 def print_detected_paths() -> None:
@@ -1502,8 +1579,9 @@ def print_detected_paths() -> None:
         print(f"  {path}")
     if detected.community_paths:
         print("PMDG packages:")
+        wasm = detected.wasm_paths[0] if detected.wasm_paths else None
         for community in detected.community_paths:
-            for package in find_pmdg_packages(community):
+            for package in find_pmdg_product_roots(community, wasm):
                 print(f"  {package}")
 
 

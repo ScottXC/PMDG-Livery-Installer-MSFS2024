@@ -6,7 +6,7 @@ import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from pmdg_livery_installer import InstallerError, install_livery
+from pmdg_livery_installer import InstallerError, find_pmdg_product_roots, install_livery
 
 
 def make_package(root: Path) -> Path:
@@ -206,6 +206,75 @@ class InstallerTests(unittest.TestCase):
                     / "texture.cfg"
                 ).exists()
             )
+
+    def test_detects_known_737_products_from_wasm(self) -> None:
+        with workspace_root() as root:
+            community = root / "Community"
+            wasm = root / "WASM" / "MSFS2024"
+            community.mkdir(parents=True)
+            for package_name in ("pmdg-aircraft-736", "pmdg-aircraft-737", "pmdg-aircraft-739"):
+                (wasm / package_name / "work").mkdir(parents=True)
+
+            products = find_pmdg_product_roots(community, wasm)
+            names = {product.name for product in products}
+
+            self.assertIn("pmdg-aircraft-736", names)
+            self.assertIn("pmdg-aircraft-737", names)
+            self.assertIn("pmdg-aircraft-739", names)
+
+    def test_installs_direct_livery_for_virtual_737_600_product(self) -> None:
+        with workspace_root() as root:
+            community = root / "Community"
+            community.mkdir(parents=True)
+            package = community / "pmdg-aircraft-736"
+            livery = root / "Virtual 736 Livery"
+            (livery / "texture.TEST").mkdir(parents=True)
+            (livery / "livery.cfg").write_text("[VERSION]\nmajor=1\nminor=0\n", encoding="utf-8")
+            (livery / "texture.TEST" / "texture.cfg").write_text("[fltsim]\n", encoding="utf-8")
+
+            install_livery(livery, package)
+            installed = (
+                community
+                / "pmdg-aircraft-736-liveries"
+                / "SimObjects"
+                / "Airplanes"
+                / "PMDG 737-600"
+                / "liveries"
+                / "pmdg"
+                / "Virtual 736 Livery"
+                / "livery.cfg"
+            )
+
+            self.assertTrue(installed.exists())
+
+    def test_installs_full_livery_package_for_virtual_737_900_product(self) -> None:
+        with workspace_root() as root:
+            community = root / "Community"
+            community.mkdir(parents=True)
+            package = community / "pmdg-aircraft-739"
+            zip_path = root / "739-package.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("pmdg-aircraft-739-liveries/manifest.json", "{}")
+                archive.writestr("pmdg-aircraft-739-liveries/layout.json", '{"content":[]}')
+                archive.writestr(
+                    "pmdg-aircraft-739-liveries/SimObjects/Airplanes/PMDG 737-900/liveries/pmdg/Virtual 739/livery.cfg",
+                    "[VERSION]\nmajor=1\nminor=0\n",
+                )
+
+            install_livery(zip_path, package)
+            installed = (
+                community
+                / "pmdg-aircraft-739-liveries"
+                / "SimObjects"
+                / "Airplanes"
+                / "PMDG 737-900"
+                / "liveries"
+                / "pmdg"
+                / "Virtual 739"
+                / "livery.cfg"
+            )
+
+            self.assertTrue(installed.exists())
 
 
 if __name__ == "__main__":
