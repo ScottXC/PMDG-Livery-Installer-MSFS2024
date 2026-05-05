@@ -31,6 +31,7 @@ ROOT_EXCLUDE_NAMES = {
     "manifest.json",
     "msfslayoutgenerator.exe",
 }
+WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 KNOWN_PMDG_AIRCRAFT_FOLDERS = {
     "pmdg-aircraft-736": "PMDG 737-600",
@@ -66,6 +67,27 @@ class DetectedPaths:
 
 def normalize_path(value: str | Path) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(str(value)))).resolve()
+
+
+def safe_name(value: str, fallback: str = "livery") -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .")
+    return cleaned or fallback
+
+
+def is_relative_to_path(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def is_reparse_point(path: Path) -> bool:
+    try:
+        attrs = path.lstat().st_file_attributes
+    except (AttributeError, OSError):
+        return path.is_symlink()
+    return bool(attrs & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def app_resource_path(relative_path: str) -> Path:
@@ -319,7 +341,7 @@ def source_root_from_input(input_path: Path, temp_dir: Path) -> Path:
     if input_path.is_file():
         if input_path.suffix.lower() not in {".zip", ".ptp"}:
             raise InstallerError("Only .zip/.ptp files or extracted livery folders are supported.")
-        extract_root = temp_dir / "extracted"
+        extract_root = temp_dir / safe_name(input_path.stem)
         extract_root.mkdir(parents=True, exist_ok=True)
         safe_extract_archive(input_path, extract_root)
         return extract_nested_ptp_files(extract_root, temp_dir)
@@ -647,17 +669,69 @@ def layout_generator_path() -> Path:
     return path
 
 
+def validate_install_safety(
+    livery_input: Path,
+    source_root: Path,
+    selected_package_root: Path,
+    livery_package_root: Path,
+    allow_linked_targets: bool,
+) -> None:
+    input_root = normalize_path(livery_input)
+    if input_root.is_file():
+        input_root = input_root.parent
+    source_root = normalize_path(source_root)
+    selected_package_root = normalize_path(selected_package_root)
+    livery_package_root = normalize_path(livery_package_root)
+
+    existing_livery_target = livery_package_root if livery_package_root.exists() else None
+    if existing_livery_target and is_reparse_point(existing_livery_target) and not allow_linked_targets:
+        raise InstallerError(
+            "The target livery package is a symlink/junction/reparse-point folder. "
+            "This is common with MSFS Addons Linker and is blocked by default to avoid "
+            "writing into a linked source folder. Move or create a real Community "
+            "livery package, or enable linked target installs only if you intentionally "
+            "want to modify the linked target."
+        )
+
+    overlap_targets = [livery_package_root]
+    if selected_package_root.exists():
+        overlap_targets.append(selected_package_root)
+
+    for target in overlap_targets:
+        if not target.exists():
+            continue
+        target_resolved = normalize_path(target)
+        if is_relative_to_path(input_root, target_resolved) or is_relative_to_path(source_root, target_resolved):
+            raise InstallerError(
+                "The selected livery source is inside the target PMDG package. "
+                "Choose a source outside Community to avoid copying a package into itself."
+            )
+        if is_relative_to_path(target_resolved, source_root):
+            raise InstallerError(
+                "The target PMDG package is inside the selected livery source. "
+                "Choose a narrower source folder or a different target package."
+            )
+
+
 def install_livery(
     livery_input: Path,
     package_root: Path,
     overwrite: bool = False,
     backup_layout: bool = True,
+    allow_linked_targets: bool = False,
 ) -> InstallReport:
     selected_package_root = validate_selected_package_root(package_root)
     livery_package_root = ensure_livery_package_root(selected_package_root)
 
     with temporary_workspace(livery_package_root) as tmp:
         source_root = source_root_from_input(livery_input, tmp)
+        validate_install_safety(
+            livery_input,
+            source_root,
+            selected_package_root,
+            livery_package_root,
+            allow_linked_targets=allow_linked_targets,
+        )
 
         livery_package_roots = find_livery_package_roots(source_root)
         if livery_package_roots:
@@ -785,6 +859,7 @@ def launch_gui() -> None:
             self.package_count_var = tk.StringVar(value="0 products detected")
             self.overwrite_var = tk.BooleanVar(value=False)
             self.backup_var = tk.BooleanVar(value=True)
+            self.allow_linked_targets_var = tk.BooleanVar(value=False)
             self.package_paths: dict[str, Path] = {}
             self.detected_packages: list[Path] = []
             self.nav_buttons: dict[str, tk.Button] = {}
@@ -812,6 +887,7 @@ def launch_gui() -> None:
             self.wasm_var.set(str(data.get("wasm", "")))
             self.overwrite_var.set(bool(data.get("overwrite", False)))
             self.backup_var.set(bool(data.get("backup_layout", True)))
+            self.allow_linked_targets_var.set(bool(data.get("allow_linked_targets", False)))
 
         def _save_settings(self) -> None:
             data = {
@@ -819,6 +895,7 @@ def launch_gui() -> None:
                 "wasm": self.wasm_var.get().strip(),
                 "overwrite": self.overwrite_var.get(),
                 "backup_layout": self.backup_var.get(),
+                "allow_linked_targets": self.allow_linked_targets_var.get(),
             }
             self.settings_path.parent.mkdir(parents=True, exist_ok=True)
             self.settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -1131,6 +1208,7 @@ def launch_gui() -> None:
             options.grid(row=1, column=1, sticky="w")
             self.checkbutton(options, "Allow overwrite", self.overwrite_var).pack(side=tk.LEFT)
             self.checkbutton(options, "Backup layout.json", self.backup_var).pack(side=tk.LEFT, padx=(18, 0))
+            self.checkbutton(options, "Allow linked targets", self.allow_linked_targets_var).pack(side=tk.LEFT, padx=(18, 0))
             action_bar = tk.Frame(install, bg=self.color("panel"))
             action_bar.grid(row=1, column=2, sticky="e", padx=(12, 0))
             self.button(action_bar, "Detect Paths", self.detect_paths).pack(side=tk.LEFT)
@@ -1204,6 +1282,7 @@ def launch_gui() -> None:
             settings_card.grid(row=0, column=0, sticky="ew", pady=(0, 14))
             self.checkbutton(settings, "Allow overwrite when matching files already exist", self.overwrite_var).grid(row=0, column=0, sticky="w", pady=(0, 8))
             self.checkbutton(settings, "Back up layout.json before rebuilding", self.backup_var).grid(row=1, column=0, sticky="w")
+            self.checkbutton(settings, "Allow linked Community targets such as symlinks or junctions", self.allow_linked_targets_var).grid(row=2, column=0, sticky="w", pady=(8, 0))
 
             paths_card, paths = self.card(body, "Saved Paths", "Stored locally for the next launch.")
             paths_card.grid(row=1, column=0, sticky="ew", pady=(0, 14))
@@ -1525,6 +1604,7 @@ def launch_gui() -> None:
                     package_root,
                     overwrite=self.overwrite_var.get(),
                     backup_layout=self.backup_var.get(),
+                    allow_linked_targets=self.allow_linked_targets_var.get(),
                 )
             except Exception as exc:  # noqa: BLE001 - GUI should surface all failures.
                 self.status_var.set("Install failed")
@@ -1551,6 +1631,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--livery", type=Path, help="Livery ZIP or extracted livery folder.")
     parser.add_argument("--overwrite", action="store_true", help="Allow overwriting existing files.")
     parser.add_argument("--no-backup", action="store_true", help="Do not back up layout.json.")
+    parser.add_argument("--allow-linked-targets", action="store_true", help="Allow writing into symlink/junction livery targets.")
     parser.add_argument("--gui", action="store_true", help="Launch the GUI.")
     return parser
 
@@ -1607,6 +1688,7 @@ def main(argv: list[str] | None = None) -> int:
             package_root,
             overwrite=args.overwrite,
             backup_layout=not args.no_backup,
+            allow_linked_targets=args.allow_linked_targets,
         )
     except InstallerError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

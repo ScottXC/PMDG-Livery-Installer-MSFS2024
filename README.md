@@ -69,6 +69,13 @@ Community\pmdg-aircraft-77w-liveries\SimObjects\Airplanes\PMDG 777-300ER\liverie
 
 It then runs the bundled `MSFSLayoutGenerator.exe` against that livery package `layout.json`, replacing the manual drag-to-layout-generator step.
 
+## Safety Notes
+
+- ZIP files that contain a livery directly at archive root are installed using the archive file name, not the temporary extraction folder name.
+- The installer refuses to install when the selected source is inside the target PMDG package, or when the target package is inside the selected source.
+- Existing livery packages that are symlinks, junctions, or other Windows reparse points are blocked by default. This is intended to protect MSFS Addons Linker workflows from accidental writes into linked source folders.
+- Use `Allow linked targets` only when you intentionally want the installer to write into a linked livery package.
+
 ## Uninstall
 
 The installer writes a user-level uninstaller. You can remove the application from:

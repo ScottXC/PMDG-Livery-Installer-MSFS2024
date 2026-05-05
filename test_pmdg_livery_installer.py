@@ -5,6 +5,7 @@ import uuid
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 from pmdg_livery_installer import InstallerError, find_pmdg_product_roots, install_livery
 
@@ -76,6 +77,41 @@ class InstallerTests(unittest.TestCase):
 
             self.assertTrue((livery_package / "manifest.json").exists())
 
+    def test_zip_root_livery_uses_archive_name_not_extracted(self) -> None:
+        with workspace_root() as root:
+            package = make_package(root)
+            zip_path = root / "Archive Named Livery.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("livery.cfg", "[VERSION]\nmajor=1\nminor=0\n")
+                archive.writestr("texture.TEST/texture.cfg", "[fltsim]\n")
+
+            install_livery(zip_path, package)
+            livery_package = livery_package_for(package)
+
+            self.assertTrue(
+                (
+                    livery_package
+                    / "SimObjects"
+                    / "Airplanes"
+                    / "PMDG 737-800"
+                    / "liveries"
+                    / "pmdg"
+                    / "Archive Named Livery"
+                    / "livery.cfg"
+                ).exists()
+            )
+            self.assertFalse(
+                (
+                    livery_package
+                    / "SimObjects"
+                    / "Airplanes"
+                    / "PMDG 737-800"
+                    / "liveries"
+                    / "pmdg"
+                    / "extracted"
+                ).exists()
+            )
+
     def test_installs_full_liveries_package_to_sibling_package(self) -> None:
         with workspace_root() as root:
             package = make_package(root)
@@ -125,6 +161,37 @@ class InstallerTests(unittest.TestCase):
 
             with self.assertRaises(InstallerError):
                 install_livery(zip_path, package)
+
+    def test_rejects_source_inside_target_package(self) -> None:
+        with workspace_root() as root:
+            package = make_package(root)
+            livery_package = livery_package_for(package)
+            source = (
+                livery_package
+                / "SimObjects"
+                / "Airplanes"
+                / "PMDG 737-800"
+                / "liveries"
+                / "pmdg"
+                / "Already Installed"
+            )
+            source.mkdir(parents=True)
+            (source / "livery.cfg").write_text("[VERSION]\nmajor=1\nminor=0\n", encoding="utf-8")
+
+            with self.assertRaises(InstallerError):
+                install_livery(source, package)
+
+    def test_rejects_linked_livery_target_by_default(self) -> None:
+        with workspace_root() as root:
+            package = make_package(root)
+            livery_package_for(package).mkdir(parents=True)
+            livery = root / "Linked Target Test"
+            (livery / "texture.TEST").mkdir(parents=True)
+            (livery / "livery.cfg").write_text("[VERSION]\nmajor=1\nminor=0\n", encoding="utf-8")
+
+            with patch("pmdg_livery_installer.is_reparse_point", return_value=True):
+                with self.assertRaises(InstallerError):
+                    install_livery(livery, package)
 
     def test_installs_zip_based_ptp(self) -> None:
         with workspace_root() as root:
