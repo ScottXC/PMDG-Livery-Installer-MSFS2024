@@ -248,15 +248,14 @@ class InstallerTests(unittest.TestCase):
                 ).exists()
             )
 
-    def test_detects_known_737_products_from_wasm(self) -> None:
+    def test_detects_known_737_products_from_community(self) -> None:
         with workspace_root() as root:
             community = root / "Community"
-            wasm = root / "WASM" / "MSFS2024"
             community.mkdir(parents=True)
             for package_name in ("pmdg-aircraft-736", "pmdg-aircraft-737", "pmdg-aircraft-739"):
-                (wasm / package_name / "work").mkdir(parents=True)
+                (community / package_name).mkdir(parents=True)
 
-            products = find_pmdg_product_roots(community, wasm)
+            products = find_pmdg_product_roots(community)
             names = {product.name for product in products}
 
             self.assertIn("pmdg-aircraft-736", names)

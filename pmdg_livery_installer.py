@@ -61,7 +61,6 @@ class InstallReport:
 @dataclass(frozen=True)
 class DetectedPaths:
     community_paths: list[Path]
-    wasm_paths: list[Path]
     user_cfg_paths: list[Path]
 
 
@@ -138,21 +137,10 @@ def detect_msfs2024_paths() -> DetectedPaths:
             if community.exists():
                 community_paths.append(community)
 
-    wasm_candidates: list[Path] = []
-    if local_appdata:
-        packages_dir = local_appdata / "Packages"
-        if packages_dir.exists():
-            for package_dir in packages_dir.glob("Microsoft.Limitless_*"):
-                wasm_candidates.append(package_dir / "LocalState" / "WASM" / "MSFS2024")
-    if appdata:
-        wasm_candidates.append(appdata / "Microsoft Flight Simulator 2024" / "WASM" / "MSFS2024")
-
-    wasm_paths = [p for p in dict.fromkeys(wasm_candidates) if p.exists()]
     community_paths = list(dict.fromkeys(community_paths))
 
     return DetectedPaths(
         community_paths=community_paths,
-        wasm_paths=wasm_paths,
         user_cfg_paths=user_cfg_paths,
     )
 
@@ -186,7 +174,7 @@ def known_airplane_folder_name(package_root: Path) -> str | None:
     return KNOWN_PMDG_AIRCRAFT_FOLDERS.get(base_package_name(package_root.name))
 
 
-def find_pmdg_product_roots(community_path: Path, wasm_path: Path | None = None) -> list[Path]:
+def find_pmdg_product_roots(community_path: Path) -> list[Path]:
     community_path = normalize_path(community_path)
     product_roots: dict[str, Path] = {}
 
@@ -200,16 +188,6 @@ def find_pmdg_product_roots(community_path: Path, wasm_path: Path | None = None)
             base_name = base_package_name(child.name)
             if base_name in KNOWN_PMDG_AIRCRAFT_FOLDERS:
                 product_roots.setdefault(base_name, community_path / base_name)
-
-    if wasm_path:
-        wasm_path = normalize_path(wasm_path)
-        if wasm_path.exists():
-            for child in wasm_path.iterdir():
-                if not child.is_dir():
-                    continue
-                base_name = base_package_name(child.name)
-                if base_name in KNOWN_PMDG_AIRCRAFT_FOLDERS:
-                    product_roots.setdefault(base_name, community_path / base_name)
 
     return sorted(product_roots.values(), key=lambda p: p.name.lower())
 
@@ -819,7 +797,6 @@ def launch_gui() -> None:
                 self.iconbitmap(str(icon_path))
 
             self.community_var = tk.StringVar()
-            self.wasm_var = tk.StringVar()
             self.livery_var = tk.StringVar()
             self.package_var = tk.StringVar()
             self.status_var = tk.StringVar(value="Ready")
@@ -851,7 +828,6 @@ def launch_gui() -> None:
             except (OSError, json.JSONDecodeError):
                 return
             self.community_var.set(str(data.get("community", "")))
-            self.wasm_var.set(str(data.get("wasm", "")))
             self.overwrite_var.set(bool(data.get("overwrite", False)))
             self.backup_var.set(bool(data.get("backup_layout", True)))
             self.allow_linked_targets_var.set(bool(data.get("allow_linked_targets", False)))
@@ -859,7 +835,6 @@ def launch_gui() -> None:
         def _save_settings(self) -> None:
             data = {
                 "community": self.community_var.get().strip(),
-                "wasm": self.wasm_var.get().strip(),
                 "overwrite": self.overwrite_var.get(),
                 "backup_layout": self.backup_var.get(),
                 "allow_linked_targets": self.allow_linked_targets_var.get(),
@@ -1143,9 +1118,6 @@ def launch_gui() -> None:
             self.label(paths, "Community folder", 9, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(4, 6))
             self.entry(paths, self.community_var).grid(row=0, column=1, sticky="ew", pady=(4, 6), ipady=7)
             self.button(paths, "Browse", self.choose_community).grid(row=0, column=2, padx=(12, 0), pady=(4, 6))
-            self.label(paths, "WASM folder", 9, self.color("muted"), "bold").grid(row=1, column=0, sticky="w", pady=(0, 2))
-            self.entry(paths, self.wasm_var).grid(row=1, column=1, sticky="ew", pady=(0, 2), ipady=7)
-            self.button(paths, "Browse", self.choose_wasm).grid(row=1, column=2, padx=(12, 0), pady=(0, 2))
 
             package_card, package = self.card(content, "Aircraft Package", "Choose the PMDG product to receive the livery.")
             package_card.grid(row=0, column=1, sticky="nsew", padx=(7, 0), pady=(0, 14))
@@ -1257,9 +1229,6 @@ def launch_gui() -> None:
             self.label(paths, "Community", 9, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(0, 8))
             self.entry(paths, self.community_var).grid(row=0, column=1, sticky="ew", pady=(0, 8), ipady=7)
             self.button(paths, "Browse", self.choose_community).grid(row=0, column=2, padx=(12, 0), pady=(0, 8))
-            self.label(paths, "WASM", 9, self.color("muted"), "bold").grid(row=1, column=0, sticky="w")
-            self.entry(paths, self.wasm_var).grid(row=1, column=1, sticky="ew", ipady=7)
-            self.button(paths, "Browse", self.choose_wasm).grid(row=1, column=2, padx=(12, 0))
 
             display_card, display = self.card(body, "Display", "Higher default resolution for a wider workspace.")
             display_card.grid(row=2, column=0, sticky="ew")
@@ -1423,16 +1392,12 @@ def launch_gui() -> None:
                 "PMDG Livery Installer MSFS2024 Diagnostics",
                 f"Application: {sys.executable}",
                 f"Community: {self.community_var.get().strip() or 'not set'}",
-                f"WASM: {self.wasm_var.get().strip() or 'not set'}",
                 "",
             ]
 
             community = Path(self.community_var.get().strip()) if self.community_var.get().strip() else None
-            wasm = Path(self.wasm_var.get().strip()) if self.wasm_var.get().strip() else None
             if community:
                 lines.append(f"Community status: {self.writable_status(community)}")
-            if wasm:
-                lines.append(f"WASM status: {self.writable_status(wasm)}")
             lines.append("")
 
             package = self.get_selected_package()
@@ -1477,16 +1442,11 @@ def launch_gui() -> None:
             detected = detect_msfs2024_paths()
             if detected.community_paths and not self.community_var.get():
                 self.community_var.set(str(detected.community_paths[0]))
-            if detected.wasm_paths and not self.wasm_var.get():
-                self.wasm_var.set(str(detected.wasm_paths[0]))
             self.log("Detected UserCfg.opt:")
             for path in detected.user_cfg_paths:
                 self.log(f"  {path}")
             self.log("Detected Community folders:")
             for path in detected.community_paths:
-                self.log(f"  {path}")
-            self.log("Detected WASM folders:")
-            for path in detected.wasm_paths:
                 self.log(f"  {path}")
             self.refresh_packages()
             self.status_var.set("Path detection complete")
@@ -1502,8 +1462,7 @@ def launch_gui() -> None:
                 self.package_count_var.set("0 products detected")
                 self.status_var.set("Select a Community folder")
                 return
-            wasm = Path(self.wasm_var.get().strip()) if self.wasm_var.get().strip() else None
-            packages = find_pmdg_product_roots(Path(community), wasm)
+            packages = find_pmdg_product_roots(Path(community))
             self.detected_packages = packages
             values = []
             for package in packages:
@@ -1529,12 +1488,6 @@ def launch_gui() -> None:
                 self.community_var.set(path)
                 self.status_var.set("Community folder selected")
                 self.refresh_packages()
-
-        def choose_wasm(self) -> None:
-            path = filedialog.askdirectory(title="Select MSFS 2024 WASM folder")
-            if path:
-                self.wasm_var.set(path)
-                self.status_var.set("WASM folder selected")
 
         def choose_zip(self) -> None:
             path = filedialog.askopenfilename(
@@ -1622,14 +1575,10 @@ def print_detected_paths() -> None:
     print("Community:")
     for path in detected.community_paths:
         print(f"  {path}")
-    print("WASM:")
-    for path in detected.wasm_paths:
-        print(f"  {path}")
     if detected.community_paths:
         print("PMDG packages:")
-        wasm = detected.wasm_paths[0] if detected.wasm_paths else None
         for community in detected.community_paths:
-            for package in find_pmdg_product_roots(community, wasm):
+            for package in find_pmdg_product_roots(community):
                 print(f"  {package}")
 
 
