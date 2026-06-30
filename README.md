@@ -113,6 +113,27 @@ python .\pmdg_livery_installer.py `
 powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 ```
 
+## Linux / Steam Proton compatibility
+
+This application targets Windows, but has been tested successfully on Linux with the Steam version of Microsoft Flight Simulator 2024 running under Proton.
+
+The important part is to run the installer/application inside the same Proton prefix as MSFS 2024. For the Steam version, the app ID is `2537590`:
+
+```bash
+protontricks-launch --appid 2537590 "/path/to/PMDG.Livery.Installer.MSFS2024.Setup.exe"
+```
+After installation, launch the installed application the same way, for example:
+
+```bash
+protontricks-launch --appid 2537590 "$HOME/.steam/steam/steamapps/compatdata/2537590/pfx/drive_c/users/steamuser/AppData/Local/Programs/PMDG Livery Installer MSFS2024/PMDG Livery Installer MSFS2024.exe"
+```
+
+### Notes
+
+- The MSFS 2024 Proton prefix should be backed up before installing third-party tools.
+- If PMDG aircraft are installed in Community2024, set the app's Community path to that folder in settings.
+- Steam may think MSFS 2024 is running while this installer/app is open and will not launch until you close the installer and relaunch MSFS 2024.
+
 </details>
 
 <details>
