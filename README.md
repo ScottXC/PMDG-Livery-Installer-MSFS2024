@@ -77,6 +77,7 @@ Use the `Installed` page to scan the selected aircraft's companion `*-liveries` 
 
 ## Safety Notes
 
+- This v0.1.5 update has not been verified in a real MSFS 2024/PMDG installation environment. Back up your relevant Community `pmdg-aircraft-*-liveries` package before using install or uninstall features.
 - ZIP files that contain a livery directly at archive root are installed using the archive file name, not the temporary extraction folder name.
 - The installer refuses to install when the selected source is inside the target PMDG package, or when the target package is inside the selected source.
 - Existing livery packages that are symlinks, junctions, or other Windows reparse points are blocked by default. This is intended to protect MSFS Addons Linker workflows from accidental writes into linked source folders.
@@ -212,6 +213,10 @@ Community\pmdg-aircraft-77w-liveries\SimObjects\Airplanes\PMDG 777-300ER\liverie
 ## 管理已安装涂装
 
 进入 `Installed` 页面后选择机型并扫描配套的 `*-liveries` 包。点击涂装会显示文件夹、元数据、文件数量、大小和可识别的缩略图。点击 `Uninstall Selected` 只会删除当前选中的单个涂装文件夹，并重新生成该 livery 包的 `layout.json`。
+
+## 安全提示
+
+本次 v0.1.5 更新未经过真实 MSFS 2024/PMDG 安装环境的实际验证。使用安装或卸载功能前，请先备份相关 Community `pmdg-aircraft-*-liveries` 包。
 
 ## 卸载
 
