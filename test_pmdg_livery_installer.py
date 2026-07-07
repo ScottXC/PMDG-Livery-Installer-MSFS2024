@@ -7,7 +7,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-from pmdg_livery_installer import InstallerError, find_pmdg_product_roots, install_livery
+from pmdg_livery_installer import (
+    InstallerError,
+    find_pmdg_product_roots,
+    install_livery,
+    list_installed_liveries,
+    uninstall_livery,
+)
 
 
 def make_package(root: Path) -> Path:
@@ -247,6 +253,78 @@ class InstallerTests(unittest.TestCase):
                     / "texture.cfg"
                 ).exists()
             )
+
+    def test_lists_installed_liveries_with_thumbnail(self) -> None:
+        with workspace_root() as root:
+            package = make_package(root)
+            livery = root / "Listed Livery"
+            (livery / "texture.TEST").mkdir(parents=True)
+            (livery / "livery.cfg").write_text(
+                '[fltsim.0]\ntitle="Listed Title"\nui_variation="Carbon"\n',
+                encoding="utf-8",
+            )
+            (livery / "texture.TEST" / "texture.cfg").write_text("[fltsim]\n", encoding="utf-8")
+            (livery / "texture.TEST" / "thumbnail.jpg").write_bytes(b"jpg")
+
+            install_livery(livery, package)
+            liveries = list_installed_liveries(package)
+
+            self.assertEqual(len(liveries), 1)
+            self.assertEqual(liveries[0].name, "Listed Livery")
+            self.assertEqual(liveries[0].aircraft_name, "PMDG 737-800")
+            self.assertEqual(liveries[0].metadata["title"], "Listed Title")
+            self.assertTrue(str(liveries[0].thumbnail_path).endswith("thumbnail.jpg"))
+
+    def test_uninstalls_selected_livery_and_leaves_others(self) -> None:
+        with workspace_root() as root:
+            package = make_package(root)
+            first = root / "Remove Me"
+            second = root / "Keep Me"
+            for livery in (first, second):
+                (livery / "texture.TEST").mkdir(parents=True)
+                (livery / "livery.cfg").write_text("[VERSION]\nmajor=1\nminor=0\n", encoding="utf-8")
+                (livery / "texture.TEST" / "texture.cfg").write_text("[fltsim]\n", encoding="utf-8")
+
+            install_livery(first, package)
+            install_livery(second, package)
+
+            report = uninstall_livery(package, "Remove Me")
+            livery_package = livery_package_for(package)
+
+            self.assertEqual(report.livery_name, "Remove Me")
+            self.assertFalse(
+                (
+                    livery_package
+                    / "SimObjects"
+                    / "Airplanes"
+                    / "PMDG 737-800"
+                    / "liveries"
+                    / "pmdg"
+                    / "Remove Me"
+                ).exists()
+            )
+            self.assertTrue(
+                (
+                    livery_package
+                    / "SimObjects"
+                    / "Airplanes"
+                    / "PMDG 737-800"
+                    / "liveries"
+                    / "pmdg"
+                    / "Keep Me"
+                    / "livery.cfg"
+                ).exists()
+            )
+
+    def test_uninstall_rejects_paths_outside_livery_package(self) -> None:
+        with workspace_root() as root:
+            package = make_package(root)
+            outside = root / "Outside"
+            outside.mkdir()
+            (outside / "livery.cfg").write_text("[VERSION]\nmajor=1\nminor=0\n", encoding="utf-8")
+
+            with self.assertRaises(InstallerError):
+                uninstall_livery(package, outside)
 
     def test_detects_known_737_products_from_community(self) -> None:
         with workspace_root() as root:

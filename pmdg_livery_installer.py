@@ -32,6 +32,14 @@ ROOT_EXCLUDE_NAMES = {
     "msfslayoutgenerator.exe",
 }
 WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+THUMBNAIL_STEMS = {
+    "thumbnail",
+    "thumbnail_small",
+    "thumbnaillarge",
+    "thumbnail_large",
+    "thumbnail_small_0",
+}
+THUMBNAIL_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ppm", ".pgm"}
 
 KNOWN_PMDG_AIRCRAFT_FOLDERS = {
     "pmdg-aircraft-736": "PMDG 737-600",
@@ -62,6 +70,34 @@ class InstallReport:
 class DetectedPaths:
     community_paths: list[Path]
     user_cfg_paths: list[Path]
+
+
+@dataclass(frozen=True)
+class InstalledLivery:
+    package_root: Path
+    aircraft_name: str
+    name: str
+    path: Path
+    thumbnail_path: Path | None
+    file_count: int
+    folder_count: int
+    total_size: int
+    modified_time: float
+    metadata: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class UninstallReport:
+    package_root: Path
+    livery_path: Path
+    aircraft_name: str
+    livery_name: str
+    removed_files: int
+    removed_dirs: int
+    removed_size: int
+    layout_entries: int = 0
+    manifest_updated: bool = False
+    backup_path: Path | None = None
 
 
 def normalize_path(value: str | Path) -> Path:
@@ -360,6 +396,202 @@ def find_direct_livery_folders(source_root: Path) -> list[Path]:
             continue
         filtered.append(candidate)
     return filtered
+
+
+def count_folder_contents(root: Path) -> tuple[int, int, int]:
+    file_count = 0
+    folder_count = 0
+    total_size = 0
+    for current, dirnames, filenames in os.walk(root):
+        folder_count += len(dirnames)
+        current_path = Path(current)
+        for filename in filenames:
+            file_count += 1
+            try:
+                total_size += (current_path / filename).stat().st_size
+            except OSError:
+                continue
+    return file_count, folder_count, total_size
+
+
+def read_livery_metadata(livery_root: Path) -> dict[str, str]:
+    cfg_path = livery_root / "livery.cfg"
+    if not cfg_path.exists():
+        return {}
+
+    metadata: dict[str, str] = {}
+    try:
+        lines = cfg_path.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
+    except OSError:
+        return metadata
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";", "[")):
+            continue
+        key, separator, value = stripped.partition("=")
+        if not separator:
+            continue
+        key = key.strip().lower()
+        value = value.strip().strip('"')
+        if key and value:
+            metadata.setdefault(key, value)
+    return metadata
+
+
+def find_livery_thumbnail(livery_root: Path) -> Path | None:
+    candidates: list[Path] = []
+    for current, dirnames, filenames in os.walk(livery_root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        current_path = Path(current)
+        for filename in filenames:
+            path = current_path / filename
+            if path.suffix.lower() not in THUMBNAIL_EXTENSIONS:
+                continue
+            if path.stem.lower() in THUMBNAIL_STEMS or path.stem.lower().startswith("thumbnail"):
+                candidates.append(path)
+
+    if not candidates:
+        return None
+
+    def thumbnail_priority(path: Path) -> tuple[int, int, int, str]:
+        rel = path.relative_to(livery_root)
+        stem = path.stem.lower()
+        exact_weight = 0 if stem == "thumbnail" else 1
+        suffix_weight = 0 if path.suffix.lower() in {".png", ".jpg", ".jpeg"} else 1
+        return (len(rel.parts), exact_weight, suffix_weight, rel.as_posix().lower())
+
+    return sorted(candidates, key=thumbnail_priority)[0]
+
+
+def livery_parent_roots(livery_package_root: Path) -> list[Path]:
+    airplanes = livery_package_root / "SimObjects" / "Airplanes"
+    if not airplanes.exists():
+        return []
+    roots: list[Path] = []
+    for aircraft in airplanes.iterdir():
+        if not aircraft.is_dir():
+            continue
+        roots.append(aircraft / "liveries" / "pmdg")
+    return roots
+
+
+def list_installed_liveries(package_root: Path) -> list[InstalledLivery]:
+    selected_package_root = validate_selected_package_root(package_root)
+    livery_package_root = ensure_livery_package_root(selected_package_root)
+    if not livery_package_root.exists():
+        return []
+
+    liveries: list[InstalledLivery] = []
+    for livery_parent in livery_parent_roots(livery_package_root):
+        if not livery_parent.exists():
+            continue
+        aircraft_name = livery_parent.parent.parent.name
+        for livery_root in livery_parent.iterdir():
+            if not livery_root.is_dir() or not looks_like_livery_folder(livery_root):
+                continue
+            file_count, folder_count, total_size = count_folder_contents(livery_root)
+            try:
+                modified_time = livery_root.stat().st_mtime
+            except OSError:
+                modified_time = 0.0
+            liveries.append(
+                InstalledLivery(
+                    package_root=livery_package_root,
+                    aircraft_name=aircraft_name,
+                    name=livery_root.name,
+                    path=livery_root,
+                    thumbnail_path=find_livery_thumbnail(livery_root),
+                    file_count=file_count,
+                    folder_count=folder_count,
+                    total_size=total_size,
+                    modified_time=modified_time,
+                    metadata=read_livery_metadata(livery_root),
+                )
+            )
+
+    return sorted(liveries, key=lambda item: (item.aircraft_name.lower(), item.name.lower()))
+
+
+def resolve_installed_livery(package_root: Path, identifier: str | Path) -> InstalledLivery:
+    selected_package_root = validate_selected_package_root(package_root)
+    raw_identifier = str(identifier).strip()
+    if not raw_identifier:
+        raise InstallerError("Select an installed livery to uninstall.")
+
+    liveries = list_installed_liveries(selected_package_root)
+    identifier_path = Path(raw_identifier)
+    if identifier_path.is_absolute() or identifier_path.exists() or any(sep in raw_identifier for sep in ("/", "\\")):
+        try:
+            normalized_identifier = normalize_path(identifier_path)
+        except OSError:
+            normalized_identifier = identifier_path
+        for livery in liveries:
+            if normalize_path(livery.path) == normalized_identifier:
+                return livery
+
+    normalized_name = raw_identifier.casefold()
+    matches = [
+        livery
+        for livery in liveries
+        if livery.name.casefold() == normalized_name
+        or f"{livery.aircraft_name}/{livery.name}".casefold() == normalized_name
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise InstallerError(
+            "More than one installed livery matches that name. "
+            "Use Aircraft/Livery Name or the full livery folder path."
+        )
+    raise InstallerError(f"Installed livery not found: {raw_identifier}")
+
+
+def uninstall_livery(
+    package_root: Path,
+    livery_identifier: str | Path,
+    backup_layout: bool = True,
+    allow_linked_targets: bool = False,
+) -> UninstallReport:
+    selected_package_root = validate_selected_package_root(package_root)
+    livery_package_root = ensure_livery_package_root(selected_package_root)
+    if not livery_package_root.exists():
+        raise InstallerError(f"Livery package does not exist: {livery_package_root}")
+    if is_reparse_point(livery_package_root) and not allow_linked_targets:
+        raise InstallerError(
+            "The target livery package is a symlink/junction/reparse-point folder. "
+            "Uninstall is blocked by default to avoid deleting files from a linked source folder."
+        )
+
+    livery = resolve_installed_livery(selected_package_root, livery_identifier)
+    livery_root = normalize_path(livery.path)
+    if is_reparse_point(livery_root):
+        raise InstallerError("The selected livery folder is a symlink/junction/reparse-point and was not removed.")
+    if not livery_root.exists() or not livery_root.is_dir():
+        raise InstallerError(f"Installed livery folder does not exist: {livery_root}")
+
+    file_count, folder_count, total_size = count_folder_contents(livery_root)
+    try:
+        shutil.rmtree(livery_root)
+    except OSError as exc:
+        raise InstallerError(f"Could not remove livery folder: {exc}") from exc
+
+    layout_entries, manifest_updated, backup_path = rebuild_layout(
+        livery_package_root,
+        backup=backup_layout,
+    )
+    return UninstallReport(
+        package_root=livery_package_root,
+        livery_path=livery_root,
+        aircraft_name=livery.aircraft_name,
+        livery_name=livery.name,
+        removed_files=file_count,
+        removed_dirs=folder_count,
+        removed_size=total_size,
+        layout_entries=layout_entries,
+        manifest_updated=manifest_updated,
+        backup_path=backup_path,
+    )
 
 
 def get_single_airplane_folder(package_root: Path) -> Path:
@@ -753,6 +985,31 @@ def format_report(report: InstallReport) -> str:
     return "\n".join(lines)
 
 
+def format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"
+
+
+def format_uninstall_report(report: UninstallReport) -> str:
+    lines = [
+        f"Livery package: {report.package_root}",
+        f"Removed livery: {report.aircraft_name}/{report.livery_name}",
+        f"Removed folder: {report.livery_path}",
+        f"Removed files: {report.removed_files}",
+        f"Removed folders: {report.removed_dirs}",
+        f"Removed size: {format_bytes(report.removed_size)}",
+        f"layout.json entries: {report.layout_entries}",
+        f"manifest.json updated: {'yes' if report.manifest_updated else 'no'}",
+    ]
+    if report.backup_path:
+        lines.append(f"layout backup: {report.backup_path}")
+    return "\n".join(lines)
+
+
 def launch_gui() -> None:
     if sys.platform == "win32":
         try:
@@ -770,27 +1027,33 @@ def launch_gui() -> None:
 
     class InstallerApp(tk.Tk):
         COLORS = {
-            "bg": "#0b0f14",
-            "top": "#080b0f",
-            "sidebar": "#0d1218",
-            "panel": "#121922",
-            "panel_alt": "#151e28",
-            "field": "#0f151d",
-            "log": "#080d12",
-            "line": "#2b3541",
-            "muted": "#9aa7b3",
-            "text": "#e8edf2",
-            "red": "#b51f2c",
-            "red_hover": "#d22937",
-            "amber": "#f2b94b",
-            "green": "#47c283",
+            "bg": "#19211f",
+            "top": "#111817",
+            "sidebar": "#141b19",
+            "sidebar_active": "#24342f",
+            "panel": "#242d2a",
+            "panel_alt": "#2d3834",
+            "field": "#171e1c",
+            "log": "#121715",
+            "line": "#34423d",
+            "line_soft": "#29342f",
+            "muted": "#a8b3ad",
+            "text": "#f2f4ef",
+            "red": "#f05262",
+            "red_hover": "#ff6a55",
+            "amber": "#e7bd55",
+            "green": "#62d08c",
+            "cyan": "#36b6cf",
+            "blue": "#3578c6",
+            "button": "#2d3935",
+            "button_hover": "#3a4943",
         }
 
         def __init__(self) -> None:
             super().__init__()
             self.title("PMDG Livery Installer MSFS2024")
-            self.geometry("1440x900")
-            self.minsize(1280, 760)
+            self.geometry("1280x780")
+            self.minsize(1120, 680)
             self.configure(bg=self.COLORS["bg"])
             icon_path = app_resource_path("assets/pmdg_livery_installer_icon.ico")
             if icon_path.exists():
@@ -806,6 +1069,9 @@ def launch_gui() -> None:
             self.allow_linked_targets_var = tk.BooleanVar(value=False)
             self.package_paths: dict[str, Path] = {}
             self.detected_packages: list[Path] = []
+            self.installed_liveries: list[InstalledLivery] = []
+            self.installed_livery_items: dict[str, InstalledLivery] = {}
+            self.thumbnail_image = None
             self.nav_buttons: dict[str, tk.Button] = {}
             self.pages: dict[str, tk.Frame] = {}
             self.settings_path = (
@@ -846,48 +1112,81 @@ def launch_gui() -> None:
 
         def _build_ui(self) -> None:
             self.option_add("*Font", ("Segoe UI", 10))
-            self.option_add("*TCombobox*Listbox.background", "#111821")
-            self.option_add("*TCombobox*Listbox.foreground", "#e8edf2")
-            self.option_add("*TCombobox*Listbox.selectBackground", "#b51f2c")
+            self.option_add("*TCombobox*Listbox.background", self.color("field"))
+            self.option_add("*TCombobox*Listbox.foreground", self.color("text"))
+            self.option_add("*TCombobox*Listbox.selectBackground", self.color("blue"))
             self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
 
             style = ttk.Style(self)
             style.theme_use("clam")
             style.configure(
                 "PMDG.TCombobox",
-                fieldbackground="#111821",
-                background="#111821",
-                foreground="#e8edf2",
-                bordercolor="#2b3541",
-                lightcolor="#2b3541",
-                darkcolor="#2b3541",
-                arrowcolor="#d7dde4",
-                padding=8,
+                fieldbackground=self.color("field"),
+                background=self.color("field"),
+                foreground=self.color("text"),
+                bordercolor=self.color("line_soft"),
+                lightcolor=self.color("line_soft"),
+                darkcolor=self.color("line_soft"),
+                arrowcolor=self.color("cyan"),
+                padding=5,
+            )
+            style.configure(
+                "PMDG.Treeview",
+                background=self.color("log"),
+                fieldbackground=self.color("log"),
+                foreground=self.color("text"),
+                bordercolor=self.color("line"),
+                lightcolor=self.color("line"),
+                darkcolor=self.color("line"),
+                rowheight=24,
+                font=("Segoe UI", 9),
+            )
+            style.configure(
+                "PMDG.Treeview.Heading",
+                background=self.color("panel_alt"),
+                foreground=self.color("text"),
+                bordercolor=self.color("line"),
+                relief=tk.FLAT,
+                font=("Segoe UI", 9, "bold"),
+            )
+            style.map(
+                "PMDG.Treeview",
+                background=[("selected", self.color("blue"))],
+                foreground=[("selected", "#ffffff")],
+            )
+            style.configure(
+                "PMDG.Vertical.TScrollbar",
+                background=self.color("panel_alt"),
+                troughcolor=self.color("log"),
+                bordercolor=self.color("log"),
+                arrowcolor=self.color("muted"),
+                relief=tk.FLAT,
             )
 
-            topbar = tk.Frame(self, bg=self.color("top"), height=104)
+            topbar = tk.Frame(self, bg=self.color("top"), height=72)
             topbar.pack(fill=tk.X)
             topbar.pack_propagate(False)
 
             brand = tk.Frame(topbar, bg=self.color("top"))
-            brand.pack(side=tk.LEFT, padx=22, pady=18)
+            brand.pack(side=tk.LEFT, padx=16, pady=12)
             tk.Label(
                 brand,
                 text="PMDG",
-                bg=self.color("red"),
+                bg=self.color("panel_alt"),
                 fg="#ffffff",
-                font=("Segoe UI", 13, "bold"),
-                width=7,
-                pady=10,
+                font=("Segoe UI", 11, "bold"),
+                width=6,
+                pady=6,
             ).pack(side=tk.LEFT)
+            tk.Frame(brand, bg=self.color("cyan"), width=3, height=30).pack(side=tk.LEFT, padx=(0, 10))
             title_box = tk.Frame(brand, bg=self.color("top"))
-            title_box.pack(side=tk.LEFT, padx=(14, 0))
+            title_box.pack(side=tk.LEFT)
             tk.Label(
                 title_box,
                 text="PMDG Livery Installer MSFS2024",
                 bg=self.color("top"),
                 fg="#ffffff",
-                font=("Segoe UI", 15, "bold"),
+                font=("Segoe UI Semibold", 13),
                 anchor="w",
             ).pack(anchor="w")
             tk.Label(
@@ -895,52 +1194,54 @@ def launch_gui() -> None:
                 text="Manual livery management for PMDG aircraft packages",
                 bg=self.color("top"),
                 fg=self.color("muted"),
-                font=("Segoe UI", 9),
+                font=("Segoe UI", 8),
                 anchor="w",
-            ).pack(anchor="w", pady=(4, 0))
+            ).pack(anchor="w", pady=(2, 0))
             tk.Label(
                 topbar,
                 textvariable=self.status_var,
-                bg=self.color("top"),
-                fg=self.color("muted"),
-                font=("Segoe UI", 10),
+                bg=self.color("panel"),
+                fg=self.color("green"),
+                font=("Segoe UI", 9),
                 anchor="e",
-            ).pack(side=tk.RIGHT, padx=24)
-            tk.Frame(self, bg=self.color("red"), height=3).pack(fill=tk.X)
+                padx=10,
+                pady=5,
+            ).pack(side=tk.RIGHT, padx=16)
+            tk.Frame(self, bg=self.color("cyan"), height=2).pack(fill=tk.X)
 
             body = tk.Frame(self, bg=self.color("bg"))
             body.pack(fill=tk.BOTH, expand=True)
 
-            sidebar = tk.Frame(body, bg=self.color("sidebar"), width=210)
+            sidebar = tk.Frame(body, bg=self.color("sidebar"), width=172)
             sidebar.pack(side=tk.LEFT, fill=tk.Y)
             sidebar.pack_propagate(False)
             tk.Label(
                 sidebar,
                 text="OPERATIONS",
                 bg=self.color("sidebar"),
-                fg=self.color("muted"),
-                font=("Segoe UI", 9, "bold"),
+                fg=self.color("cyan"),
+                font=("Segoe UI", 8, "bold"),
                 anchor="w",
-            ).pack(fill=tk.X, padx=18, pady=(24, 8))
+            ).pack(fill=tk.X, padx=14, pady=(14, 6))
 
-            for page_name in ("Products", "Liveries", "Diagnostics", "Settings"):
+            for page_name in ("Products", "Installed", "Liveries", "Diagnostics", "Settings"):
                 nav = tk.Button(
                     sidebar,
                     text=page_name,
                     command=lambda name=page_name: self.show_page(name),
                     bg=self.color("sidebar"),
-                    activebackground=self.color("red_hover"),
+                    activebackground=self.color("sidebar_active"),
                     fg="#c4ccd5",
                     activeforeground="#ffffff",
                     relief=tk.FLAT,
                     bd=0,
                     cursor="hand2",
-                    font=("Segoe UI", 10),
+                    font=("Segoe UI", 9),
                     anchor="w",
-                    padx=18,
-                    pady=12,
+                    padx=14,
+                    pady=8,
                 )
-                nav.pack(fill=tk.X, pady=(2, 0))
+                nav.pack(fill=tk.X, pady=(1, 0))
                 self.nav_buttons[page_name] = nav
             tk.Label(
                 sidebar,
@@ -948,17 +1249,18 @@ def launch_gui() -> None:
                 bg=self.color("sidebar"),
                 fg=self.color("muted"),
                 justify=tk.LEFT,
-                font=("Segoe UI", 9),
+                font=("Segoe UI", 8),
                 anchor="sw",
-            ).pack(side=tk.BOTTOM, fill=tk.X, padx=18, pady=20)
+            ).pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=14)
 
             self.page_container = tk.Frame(body, bg=self.color("bg"))
-            self.page_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=18, pady=18)
+            self.page_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=12, pady=12)
             self.page_container.rowconfigure(0, weight=1)
             self.page_container.columnconfigure(0, weight=1)
 
             for page_name, factory in (
                 ("Products", self._create_products_page),
+                ("Installed", self._create_installed_page),
                 ("Liveries", self._create_liveries_page),
                 ("Diagnostics", self._create_diagnostics_page),
                 ("Settings", self._create_settings_page),
@@ -978,8 +1280,8 @@ def launch_gui() -> None:
             )
 
         def button(self, parent, text, command, accent=False):
-            bg = self.color("red") if accent else "#1c2632"
-            active = self.color("red_hover") if accent else "#263241"
+            bg = self.color("red") if accent else self.color("button")
+            active = self.color("red_hover") if accent else self.color("button_hover")
             return tk.Button(
                 parent,
                 text=text,
@@ -990,10 +1292,10 @@ def launch_gui() -> None:
                 activeforeground="#ffffff",
                 relief=tk.FLAT,
                 bd=0,
-                padx=16,
-                pady=9,
+                padx=12,
+                pady=6,
                 cursor="hand2",
-                font=("Segoe UI", 10, "bold" if accent else "normal"),
+                font=("Segoe UI", 9, "bold" if accent else "normal"),
             )
 
         def entry(self, parent, variable):
@@ -1005,22 +1307,22 @@ def launch_gui() -> None:
                 insertbackground=self.color("text"),
                 relief=tk.FLAT,
                 highlightthickness=1,
-                highlightbackground=self.color("line"),
-                highlightcolor=self.color("red"),
+                highlightbackground=self.color("line_soft"),
+                highlightcolor=self.color("cyan"),
                 bd=0,
-                font=("Segoe UI", 10),
+                font=("Segoe UI", 9),
             )
 
         def card(self, parent, title, subtitle=None):
-            frame = tk.Frame(parent, bg=self.color("panel"), highlightthickness=1, highlightbackground="#202a35")
+            frame = tk.Frame(parent, bg=self.color("panel"), highlightthickness=0)
             frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(2, weight=1)
+            tk.Frame(frame, bg=self.color("cyan"), height=1).grid(row=0, column=0, sticky="ew")
             header = tk.Frame(frame, bg=self.color("panel"))
-            header.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 10))
-            self.label(header, title, 12, self.color("text"), "bold").pack(anchor="w")
-            if subtitle:
-                self.label(header, subtitle, 9, self.color("muted")).pack(anchor="w", pady=(2, 0))
+            header.grid(row=1, column=0, sticky="ew", padx=12, pady=(8, 4))
+            self.label(header, title, 10, self.color("text"), "bold").pack(anchor="w")
             content = tk.Frame(frame, bg=self.color("panel"))
-            content.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
+            content.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
             content.columnconfigure(0, weight=1)
             return frame, content
 
@@ -1028,11 +1330,12 @@ def launch_gui() -> None:
             page = tk.Frame(self.page_container, bg=self.color("bg"))
             page.rowconfigure(1, weight=1)
             page.columnconfigure(0, weight=1)
-            header = tk.Frame(page, bg=self.color("panel_alt"), highlightthickness=1, highlightbackground=self.color("line"))
-            header.grid(row=0, column=0, sticky="ew", pady=(0, 14))
-            header.columnconfigure(0, weight=1)
-            self.label(header, headline.upper(), 9, self.color("amber"), "bold").grid(row=0, column=0, sticky="w", padx=16, pady=(12, 2))
-            self.label(header, subhead, 10, self.color("text")).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
+            header = tk.Frame(page, bg=self.color("panel_alt"), highlightthickness=0)
+            header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+            header.columnconfigure(1, weight=1)
+            tk.Frame(header, bg=self.color("blue"), width=5).grid(row=0, column=0, rowspan=2, sticky="ns")
+            self.label(header, headline.upper(), 8, self.color("cyan"), "bold").grid(row=0, column=1, sticky="w", padx=12, pady=(8, 1))
+            self.label(header, subhead, 9, self.color("text")).grid(row=1, column=1, sticky="w", padx=12, pady=(0, 8))
             return page
 
         def _create_products_page(self):
@@ -1044,14 +1347,14 @@ def launch_gui() -> None:
             content.columnconfigure(1, weight=2)
 
             summary_card, summary = self.card(content, "Product Library", "Community packages that look like PMDG aircraft products.")
-            summary_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
+            summary_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
             summary.columnconfigure(0, weight=1)
             tk.Label(
                 summary,
                 textvariable=self.package_count_var,
                 bg=self.color("panel"),
                 fg=self.color("amber"),
-                font=("Segoe UI", 24, "bold"),
+                font=("Segoe UI Semibold", 18),
                 anchor="w",
             ).grid(row=0, column=0, sticky="ew")
             actions = tk.Frame(summary, bg=self.color("panel"))
@@ -1067,23 +1370,22 @@ def launch_gui() -> None:
                 list_body,
                 bg=self.color("log"),
                 fg=self.color("text"),
-                selectbackground=self.color("red"),
+                selectbackground=self.color("blue"),
                 selectforeground="#ffffff",
                 relief=tk.FLAT,
                 bd=0,
-                highlightthickness=1,
-                highlightbackground=self.color("line"),
+                highlightthickness=0,
                 font=("Segoe UI", 10),
                 activestyle="none",
             )
             self.product_listbox.grid(row=0, column=0, sticky="nsew")
-            product_scrollbar = ttk.Scrollbar(list_body, orient=tk.VERTICAL, command=self.product_listbox.yview)
+            product_scrollbar = ttk.Scrollbar(list_body, orient=tk.VERTICAL, command=self.product_listbox.yview, style="PMDG.Vertical.TScrollbar")
             product_scrollbar.grid(row=0, column=1, sticky="ns")
             self.product_listbox.configure(yscrollcommand=product_scrollbar.set)
             self.product_listbox.bind("<<ListboxSelect>>", self.on_product_select)
 
             detail_card, detail_body = self.card(content, "Product Details", "Manifest, layout, aircraft folders and livery inventory.")
-            detail_card.grid(row=1, column=1, sticky="nsew", padx=(7, 0))
+            detail_card.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
             detail_card.rowconfigure(1, weight=1)
             detail_body.rowconfigure(0, weight=1)
             self.product_detail_text = tk.Text(
@@ -1092,15 +1394,108 @@ def launch_gui() -> None:
                 fg="#cfd7df",
                 relief=tk.FLAT,
                 bd=0,
-                padx=14,
-                pady=12,
+                padx=10,
+                pady=8,
                 wrap="word",
-                font=("Consolas", 10),
+                font=("Consolas", 9),
             )
             self.product_detail_text.grid(row=0, column=0, sticky="nsew")
-            detail_scrollbar = ttk.Scrollbar(detail_body, orient=tk.VERTICAL, command=self.product_detail_text.yview)
+            detail_scrollbar = ttk.Scrollbar(detail_body, orient=tk.VERTICAL, command=self.product_detail_text.yview, style="PMDG.Vertical.TScrollbar")
             detail_scrollbar.grid(row=0, column=1, sticky="ns")
             self.product_detail_text.configure(yscrollcommand=detail_scrollbar.set)
+            return page
+
+        def _create_installed_page(self):
+            page = self.make_page("Installed", "Manage liveries in the companion Community livery package.")
+            page.rowconfigure(1, weight=1)
+            content = tk.Frame(page, bg=self.color("bg"))
+            content.grid(row=1, column=0, sticky="nsew")
+            content.columnconfigure(0, weight=3)
+            content.columnconfigure(1, weight=2)
+            content.rowconfigure(1, weight=1)
+
+            package_card, package = self.card(content, "Aircraft Package", "Choose a PMDG product and scan its installed livery package.")
+            package_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+            package.columnconfigure(0, weight=1)
+            self.installed_package_combo = ttk.Combobox(package, textvariable=self.package_var, state="readonly", style="PMDG.TCombobox")
+            self.installed_package_combo.grid(row=0, column=0, sticky="ew", padx=(0, 8), ipady=2)
+            self.installed_package_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_installed_liveries())
+            self.button(package, "Refresh Products", self.refresh_packages).grid(row=0, column=1, padx=(0, 8))
+            self.button(package, "Scan Liveries", self.refresh_installed_liveries, accent=True).grid(row=0, column=2)
+
+            list_card, list_body = self.card(content, "Installed Liveries", "Select a livery to inspect its files and thumbnail.")
+            list_card.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
+            list_card.rowconfigure(1, weight=1)
+            list_body.rowconfigure(0, weight=1)
+            list_body.columnconfigure(0, weight=1)
+            self.installed_tree = ttk.Treeview(
+                list_body,
+                columns=("aircraft", "livery", "files", "size", "modified"),
+                show="headings",
+                selectmode="browse",
+                style="PMDG.Treeview",
+            )
+            self.installed_tree.heading("aircraft", text="Aircraft")
+            self.installed_tree.heading("livery", text="Livery")
+            self.installed_tree.heading("files", text="Files")
+            self.installed_tree.heading("size", text="Size")
+            self.installed_tree.heading("modified", text="Modified")
+            self.installed_tree.column("aircraft", width=155, minwidth=120, stretch=False)
+            self.installed_tree.column("livery", width=320, minwidth=180, stretch=True)
+            self.installed_tree.column("files", width=70, minwidth=60, anchor="e", stretch=False)
+            self.installed_tree.column("size", width=95, minwidth=80, anchor="e", stretch=False)
+            self.installed_tree.column("modified", width=150, minwidth=130, stretch=False)
+            self.installed_tree.grid(row=0, column=0, sticky="nsew")
+            installed_scrollbar = ttk.Scrollbar(list_body, orient=tk.VERTICAL, command=self.installed_tree.yview, style="PMDG.Vertical.TScrollbar")
+            installed_scrollbar.grid(row=0, column=1, sticky="ns")
+            self.installed_tree.configure(yscrollcommand=installed_scrollbar.set)
+            self.installed_tree.bind("<<TreeviewSelect>>", self.on_installed_livery_select)
+
+            preview_card, preview = self.card(content, "Preview", "Thumbnail, metadata and uninstall controls for the selected livery.")
+            preview_card.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
+            preview_card.rowconfigure(1, weight=1)
+            preview.columnconfigure(0, weight=1)
+            preview.rowconfigure(1, weight=1)
+            preview_shell = tk.Frame(
+                preview,
+                bg=self.color("log"),
+                height=190,
+                highlightthickness=0,
+            )
+            preview_shell.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+            preview_shell.grid_propagate(False)
+            self.thumbnail_label = tk.Label(
+                preview_shell,
+                text="No livery selected",
+                bg=self.color("log"),
+                fg=self.color("muted"),
+                justify=tk.CENTER,
+                font=("Segoe UI", 10),
+            )
+            self.thumbnail_label.place(relx=0.5, rely=0.5, anchor="center")
+
+            self.installed_detail_text = tk.Text(
+                preview,
+                height=7,
+                bg=self.color("log"),
+                fg="#cfd7df",
+                relief=tk.FLAT,
+                bd=0,
+                padx=10,
+                pady=8,
+                wrap="word",
+                font=("Consolas", 9),
+            )
+            self.installed_detail_text.grid(row=1, column=0, sticky="nsew")
+            detail_scrollbar = ttk.Scrollbar(preview, orient=tk.VERTICAL, command=self.installed_detail_text.yview, style="PMDG.Vertical.TScrollbar")
+            detail_scrollbar.grid(row=1, column=1, sticky="ns")
+            self.installed_detail_text.configure(yscrollcommand=detail_scrollbar.set)
+
+            actions = tk.Frame(preview, bg=self.color("panel"))
+            actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            self.button(actions, "Copy Path", self.copy_installed_livery_path).pack(side=tk.LEFT)
+            self.button(actions, "Refresh", self.refresh_installed_liveries).pack(side=tk.LEFT, padx=(10, 0))
+            self.button(actions, "Uninstall Selected", self.uninstall_selected_livery, accent=True).pack(side=tk.RIGHT)
             return page
 
         def _create_liveries_page(self):
@@ -1113,45 +1508,45 @@ def launch_gui() -> None:
             content.rowconfigure(3, weight=1)
 
             paths_card, paths = self.card(content, "Simulator Paths", "Detected automatically; override when needed.")
-            paths_card.grid(row=0, column=0, sticky="nsew", padx=(0, 7), pady=(0, 14))
+            paths_card.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))
             paths.columnconfigure(1, weight=1)
-            self.label(paths, "Community folder", 9, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(4, 6))
-            self.entry(paths, self.community_var).grid(row=0, column=1, sticky="ew", pady=(4, 6), ipady=7)
-            self.button(paths, "Browse", self.choose_community).grid(row=0, column=2, padx=(12, 0), pady=(4, 6))
+            self.label(paths, "Community folder", 8, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(2, 4))
+            self.entry(paths, self.community_var).grid(row=0, column=1, sticky="ew", pady=(2, 4), ipady=4)
+            self.button(paths, "Browse", self.choose_community).grid(row=0, column=2, padx=(8, 0), pady=(2, 4))
 
             package_card, package = self.card(content, "Aircraft Package", "Choose the PMDG product to receive the livery.")
-            package_card.grid(row=0, column=1, sticky="nsew", padx=(7, 0), pady=(0, 14))
+            package_card.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=(0, 8))
             package.columnconfigure(0, weight=1)
             tk.Label(
                 package,
                 textvariable=self.package_count_var,
                 bg=self.color("panel"),
                 fg=self.color("amber"),
-                font=("Segoe UI", 20, "bold"),
+                font=("Segoe UI Semibold", 16),
                 anchor="w",
-            ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+            ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
             self.package_combo = ttk.Combobox(package, textvariable=self.package_var, state="readonly", style="PMDG.TCombobox")
-            self.package_combo.grid(row=1, column=0, sticky="ew", padx=(0, 8), ipady=4)
+            self.package_combo.grid(row=1, column=0, sticky="ew", padx=(0, 6), ipady=2)
             self.button(package, "Refresh", self.refresh_packages).grid(row=1, column=1)
 
             install_card, install = self.card(content, "Livery Package", "Select a ZIP or extracted livery folder.")
-            install_card.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 14))
+            install_card.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
             install.columnconfigure(1, weight=1)
-            self.label(install, "Source", 9, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(0, 12))
-            self.entry(install, self.livery_var).grid(row=0, column=1, sticky="ew", pady=(0, 12), ipady=7)
+            self.label(install, "Source", 8, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(0, 8))
+            self.entry(install, self.livery_var).grid(row=0, column=1, sticky="ew", pady=(0, 8), ipady=4)
             browse_menu = tk.Frame(install, bg=self.color("panel"))
-            browse_menu.grid(row=0, column=2, sticky="e", padx=(12, 0), pady=(0, 12))
+            browse_menu.grid(row=0, column=2, sticky="e", padx=(8, 0), pady=(0, 8))
             self.button(browse_menu, "ZIP", self.choose_zip).pack(side=tk.LEFT)
             self.button(browse_menu, "Folder", self.choose_livery_folder).pack(side=tk.LEFT, padx=(8, 0))
             options = tk.Frame(install, bg=self.color("panel"))
             options.grid(row=1, column=1, sticky="w")
             self.checkbutton(options, "Allow overwrite", self.overwrite_var).pack(side=tk.LEFT)
-            self.checkbutton(options, "Backup layout.json", self.backup_var).pack(side=tk.LEFT, padx=(18, 0))
-            self.checkbutton(options, "Allow linked targets", self.allow_linked_targets_var).pack(side=tk.LEFT, padx=(18, 0))
+            self.checkbutton(options, "Backup layout.json", self.backup_var).pack(side=tk.LEFT, padx=(12, 0))
+            self.checkbutton(options, "Allow linked targets", self.allow_linked_targets_var).pack(side=tk.LEFT, padx=(12, 0))
             action_bar = tk.Frame(install, bg=self.color("panel"))
-            action_bar.grid(row=1, column=2, sticky="e", padx=(12, 0))
+            action_bar.grid(row=1, column=2, sticky="e", padx=(8, 0))
             self.button(action_bar, "Detect Paths", self.detect_paths).pack(side=tk.LEFT)
-            self.button(action_bar, "Install Livery", self.install_selected, accent=True).pack(side=tk.LEFT, padx=(10, 0))
+            self.button(action_bar, "Install Livery", self.install_selected, accent=True).pack(side=tk.LEFT, padx=(8, 0))
 
             log_card, log_body = self.card(content, "Activity Log", "Detection, copy, layout rebuild and install results.")
             log_card.grid(row=3, column=0, columnspan=2, sticky="nsew")
@@ -1159,19 +1554,19 @@ def launch_gui() -> None:
             log_body.rowconfigure(0, weight=1)
             self.log_text = tk.Text(
                 log_body,
-                height=11,
+                height=8,
                 wrap="word",
                 bg=self.color("log"),
                 fg="#cfd7df",
                 insertbackground="#ffffff",
                 relief=tk.FLAT,
                 bd=0,
-                padx=14,
-                pady=12,
+                padx=10,
+                pady=8,
                 font=("Consolas", 9),
             )
             self.log_text.grid(row=0, column=0, sticky="nsew")
-            log_scrollbar = ttk.Scrollbar(log_body, orient=tk.VERTICAL, command=self.log_text.yview)
+            log_scrollbar = ttk.Scrollbar(log_body, orient=tk.VERTICAL, command=self.log_text.yview, style="PMDG.Vertical.TScrollbar")
             log_scrollbar.grid(row=0, column=1, sticky="ns")
             self.log_text.configure(yscrollcommand=log_scrollbar.set)
             return page
@@ -1185,10 +1580,10 @@ def launch_gui() -> None:
             body.rowconfigure(1, weight=1)
 
             tools_card, tools = self.card(body, "Tools", "Run checks before installing or rebuild layout.json after manual changes.")
-            tools_card.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+            tools_card.grid(row=0, column=0, sticky="ew", pady=(0, 8))
             self.button(tools, "Run Diagnostics", self.run_diagnostics, accent=True).pack(side=tk.LEFT)
-            self.button(tools, "Detect Paths", self.detect_paths).pack(side=tk.LEFT, padx=(10, 0))
-            self.button(tools, "Rebuild Selected layout.json", self.rebuild_selected_layout).pack(side=tk.LEFT, padx=(10, 0))
+            self.button(tools, "Detect Paths", self.detect_paths).pack(side=tk.LEFT, padx=(8, 0))
+            self.button(tools, "Rebuild Selected layout.json", self.rebuild_selected_layout).pack(side=tk.LEFT, padx=(8, 0))
 
             report_card, report = self.card(body, "Diagnostic Report", "Copy this output when troubleshooting missing liveries.")
             report_card.grid(row=1, column=0, sticky="nsew")
@@ -1200,13 +1595,13 @@ def launch_gui() -> None:
                 fg="#cfd7df",
                 relief=tk.FLAT,
                 bd=0,
-                padx=14,
-                pady=12,
+                padx=10,
+                pady=8,
                 wrap="word",
-                font=("Consolas", 10),
+                font=("Consolas", 9),
             )
             self.diagnostics_text.grid(row=0, column=0, sticky="nsew")
-            diagnostics_scrollbar = ttk.Scrollbar(report, orient=tk.VERTICAL, command=self.diagnostics_text.yview)
+            diagnostics_scrollbar = ttk.Scrollbar(report, orient=tk.VERTICAL, command=self.diagnostics_text.yview, style="PMDG.Vertical.TScrollbar")
             diagnostics_scrollbar.grid(row=0, column=1, sticky="ns")
             self.diagnostics_text.configure(yscrollcommand=diagnostics_scrollbar.set)
             return page
@@ -1218,23 +1613,23 @@ def launch_gui() -> None:
             body.columnconfigure(0, weight=1)
 
             settings_card, settings = self.card(body, "Install Behavior", "These settings are shared by the Liveries page.")
-            settings_card.grid(row=0, column=0, sticky="ew", pady=(0, 14))
-            self.checkbutton(settings, "Allow overwrite when matching files already exist", self.overwrite_var).grid(row=0, column=0, sticky="w", pady=(0, 8))
+            settings_card.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+            self.checkbutton(settings, "Allow overwrite when matching files already exist", self.overwrite_var).grid(row=0, column=0, sticky="w", pady=(0, 5))
             self.checkbutton(settings, "Back up layout.json before rebuilding", self.backup_var).grid(row=1, column=0, sticky="w")
-            self.checkbutton(settings, "Allow linked Community targets such as symlinks or junctions", self.allow_linked_targets_var).grid(row=2, column=0, sticky="w", pady=(8, 0))
+            self.checkbutton(settings, "Allow linked Community targets such as symlinks or junctions", self.allow_linked_targets_var).grid(row=2, column=0, sticky="w", pady=(5, 0))
 
             paths_card, paths = self.card(body, "Saved Paths", "Stored locally for the next launch.")
-            paths_card.grid(row=1, column=0, sticky="ew", pady=(0, 14))
+            paths_card.grid(row=1, column=0, sticky="ew", pady=(0, 8))
             paths.columnconfigure(1, weight=1)
-            self.label(paths, "Community", 9, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(0, 8))
-            self.entry(paths, self.community_var).grid(row=0, column=1, sticky="ew", pady=(0, 8), ipady=7)
-            self.button(paths, "Browse", self.choose_community).grid(row=0, column=2, padx=(12, 0), pady=(0, 8))
+            self.label(paths, "Community", 8, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(0, 5))
+            self.entry(paths, self.community_var).grid(row=0, column=1, sticky="ew", pady=(0, 5), ipady=4)
+            self.button(paths, "Browse", self.choose_community).grid(row=0, column=2, padx=(8, 0), pady=(0, 5))
 
             display_card, display = self.card(body, "Display", "Higher default resolution for a wider workspace.")
             display_card.grid(row=2, column=0, sticky="ew")
-            self.button(display, "1280 x 780", lambda: self.geometry("1280x780")).pack(side=tk.LEFT)
-            self.button(display, "1440 x 900", lambda: self.geometry("1440x900")).pack(side=tk.LEFT, padx=(10, 0))
-            self.button(display, "1600 x 960", lambda: self.geometry("1600x960")).pack(side=tk.LEFT, padx=(10, 0))
+            self.button(display, "1180 x 720", lambda: self.geometry("1180x720")).pack(side=tk.LEFT)
+            self.button(display, "1280 x 780", lambda: self.geometry("1280x780")).pack(side=tk.LEFT, padx=(8, 0))
+            self.button(display, "1440 x 860", lambda: self.geometry("1440x860")).pack(side=tk.LEFT, padx=(8, 0))
             self.button(display, "Save Settings", self._save_settings, accent=True).pack(side=tk.RIGHT)
             return page
 
@@ -1247,7 +1642,7 @@ def launch_gui() -> None:
                 fg=self.color("text"),
                 selectcolor=self.color("field"),
                 activebackground=parent["bg"],
-                activeforeground=self.color("text"),
+                activeforeground=self.color("cyan"),
                 relief=tk.FLAT,
                 font=("Segoe UI", 10),
             )
@@ -1257,8 +1652,8 @@ def launch_gui() -> None:
             for name, button in self.nav_buttons.items():
                 active = name == page_name
                 button.configure(
-                    bg=self.color("red") if active else self.color("sidebar"),
-                    fg="#ffffff" if active else "#c4ccd5",
+                    bg=self.color("sidebar_active") if active else self.color("sidebar"),
+                    fg=self.color("cyan") if active else "#c4ccd5",
                     font=("Segoe UI", 10, "bold" if active else "normal"),
                 )
             self.status_var.set(f"{page_name} ready")
@@ -1340,6 +1735,17 @@ def launch_gui() -> None:
                 lines.append("  none found")
             lines.append("")
 
+            livery_package = ensure_livery_package_root(package_root)
+            lines.append("Companion livery package:")
+            lines.append(f"  path: {livery_package}")
+            lines.append(f"  status: {'present' if livery_package.exists() else 'not created'}")
+            try:
+                installed_liveries = list_installed_liveries(package_root)
+                lines.append(f"  installed liveries: {len(installed_liveries)}")
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"  livery scan failed: {exc}")
+            lines.append("")
+
             try:
                 total_files = sum(1 for _ in iter_layout_files(package_root))
                 lines.append(f"Files included by layout builder: {total_files}")
@@ -1373,6 +1779,252 @@ def launch_gui() -> None:
                     break
             self.set_text(self.product_detail_text, self.describe_package(package))
             self.status_var.set(f"Selected {package.name}")
+
+        def selected_installed_livery(self) -> InstalledLivery | None:
+            if not hasattr(self, "installed_tree"):
+                return None
+            selection = self.installed_tree.selection()
+            if not selection:
+                return None
+            return self.installed_livery_items.get(selection[0])
+
+        def installed_livery_details(self, livery: InstalledLivery) -> str:
+            lines = [
+                f"Aircraft: {livery.aircraft_name}",
+                f"Livery: {livery.name}",
+                f"Folder: {livery.path}",
+                f"Thumbnail: {livery.thumbnail_path or 'not found'}",
+                f"Files: {livery.file_count}",
+                f"Folders: {livery.folder_count}",
+                f"Size: {format_bytes(livery.total_size)}",
+            ]
+            if livery.modified_time:
+                lines.append(f"Modified: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(livery.modified_time))}")
+            if livery.metadata:
+                lines.append("")
+                lines.append("Metadata:")
+                for key in ("title", "ui_variation", "atc_id", "icao_airline", "atc_airline"):
+                    if key in livery.metadata:
+                        lines.append(f"  {key}: {livery.metadata[key]}")
+            return "\n".join(lines)
+
+        def clear_thumbnail(self, message: str) -> None:
+            self.thumbnail_image = None
+            self.thumbnail_label.configure(image="", text=message, fg=self.color("muted"))
+
+        def load_thumbnail(self, path: Path):
+            max_width = 520
+            max_height = 240
+            try:
+                from PIL import Image, ImageTk  # type: ignore
+
+                with Image.open(path) as image:
+                    image.thumbnail((max_width, max_height))
+                    return ImageTk.PhotoImage(image.copy()), None
+            except ImportError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                return None, str(exc)
+
+            try:
+                image = tk.PhotoImage(file=str(path))
+                width = max(image.width(), 1)
+                height = max(image.height(), 1)
+                factor = max(
+                    1,
+                    (width + max_width - 1) // max_width,
+                    (height + max_height - 1) // max_height,
+                )
+                if factor > 1:
+                    image = image.subsample(factor, factor)
+                return image, None
+            except Exception as exc:  # noqa: BLE001
+                converted_path, convert_error = self.convert_thumbnail_with_powershell(path, max_width, max_height)
+                if not converted_path:
+                    return None, str(exc) if not convert_error else convert_error
+                try:
+                    image = tk.PhotoImage(file=str(converted_path))
+                    return image, None
+                except Exception as converted_exc:  # noqa: BLE001
+                    return None, str(converted_exc)
+                finally:
+                    try:
+                        converted_path.unlink()
+                    except OSError:
+                        pass
+
+        def convert_thumbnail_with_powershell(self, path: Path, max_width: int, max_height: int) -> tuple[Path | None, str | None]:
+            if sys.platform != "win32":
+                return None, None
+            temp_dir = Path(os.environ.get("TEMP") or os.environ.get("TMP") or Path.cwd())
+            output_path = temp_dir / f"pmdg_livery_thumb_{uuid.uuid4().hex}.png"
+            script = r"""
+& {
+    param([string]$Source, [string]$Dest, [int]$MaxWidth, [int]$MaxHeight)
+    Add-Type -AssemblyName System.Drawing
+    $img = [System.Drawing.Image]::FromFile($Source)
+    try {
+        $scale = [Math]::Min($MaxWidth / $img.Width, $MaxHeight / $img.Height)
+        if ($scale -gt 1) { $scale = 1 }
+        $width = [Math]::Max(1, [int][Math]::Round($img.Width * $scale))
+        $height = [Math]::Max(1, [int][Math]::Round($img.Height * $scale))
+        $bmp = New-Object System.Drawing.Bitmap($width, $height)
+        try {
+            $graphics = [System.Drawing.Graphics]::FromImage($bmp)
+            try {
+                $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                $graphics.DrawImage($img, 0, 0, $width, $height)
+            } finally {
+                $graphics.Dispose()
+            }
+            $bmp.Save($Dest, [System.Drawing.Imaging.ImageFormat]::Png)
+        } finally {
+            $bmp.Dispose()
+        }
+    } finally {
+        $img.Dispose()
+    }
+}
+"""
+            try:
+                result = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-Command", script, str(path), str(output_path), str(max_width), str(max_height)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+                )
+            except OSError as exc:
+                return None, str(exc)
+            if result.returncode != 0 or not output_path.exists():
+                try:
+                    output_path.unlink()
+                except OSError:
+                    pass
+                detail = (result.stderr or result.stdout or "PowerShell image conversion failed").strip()
+                return None, detail
+            return output_path, None
+
+        def show_thumbnail(self, livery: InstalledLivery) -> None:
+            if not livery.thumbnail_path:
+                self.clear_thumbnail("No thumbnail found")
+                return
+            image, error = self.load_thumbnail(livery.thumbnail_path)
+            if image is None:
+                self.clear_thumbnail(f"Thumbnail preview failed\n{error}")
+                return
+            self.thumbnail_image = image
+            self.thumbnail_label.configure(image=self.thumbnail_image, text="")
+
+        def refresh_installed_liveries(self) -> None:
+            if not hasattr(self, "installed_tree"):
+                return
+            package = self.get_selected_package()
+            existing_items = self.installed_tree.get_children()
+            if existing_items:
+                self.installed_tree.delete(*existing_items)
+            self.installed_livery_items.clear()
+            self.installed_liveries = []
+            if not package:
+                self.set_text(self.installed_detail_text, "No PMDG product selected.")
+                self.clear_thumbnail("No product selected")
+                self.status_var.set("Select a PMDG product")
+                return
+
+            try:
+                liveries = list_installed_liveries(package)
+            except Exception as exc:  # noqa: BLE001
+                self.set_text(self.installed_detail_text, f"Installed livery scan failed:\n{exc}")
+                self.clear_thumbnail("Scan failed")
+                self.status_var.set("Installed livery scan failed")
+                self.log(f"ERROR: installed livery scan failed: {exc}")
+                return
+
+            self.installed_liveries = liveries
+            for index, livery in enumerate(liveries):
+                iid = str(index)
+                modified = (
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(livery.modified_time))
+                    if livery.modified_time
+                    else "n/a"
+                )
+                self.installed_livery_items[iid] = livery
+                self.installed_tree.insert(
+                    "",
+                    tk.END,
+                    iid=iid,
+                    values=(
+                        livery.aircraft_name,
+                        livery.metadata.get("title") or livery.name,
+                        livery.file_count,
+                        format_bytes(livery.total_size),
+                        modified,
+                    ),
+                )
+
+            if liveries:
+                self.installed_tree.selection_set("0")
+                self.installed_tree.focus("0")
+                self.on_installed_livery_select()
+            else:
+                livery_root = ensure_livery_package_root(package)
+                self.set_text(self.installed_detail_text, f"No installed liveries found.\n\nLivery package: {livery_root}")
+                self.clear_thumbnail("No installed liveries")
+            noun = "livery" if len(liveries) == 1 else "liveries"
+            self.status_var.set(f"{len(liveries)} installed {noun}")
+            self.log(f"Found {len(liveries)} installed {noun}.")
+
+        def on_installed_livery_select(self, _event=None) -> None:
+            livery = self.selected_installed_livery()
+            if not livery:
+                return
+            self.set_text(self.installed_detail_text, self.installed_livery_details(livery))
+            self.show_thumbnail(livery)
+            self.status_var.set(f"Selected {livery.name}")
+
+        def copy_installed_livery_path(self) -> None:
+            livery = self.selected_installed_livery()
+            if not livery:
+                self.status_var.set("No installed livery selected")
+                return
+            self.clipboard_clear()
+            self.clipboard_append(str(livery.path))
+            self.status_var.set("Livery path copied")
+
+        def uninstall_selected_livery(self) -> None:
+            package = self.get_selected_package()
+            livery = self.selected_installed_livery()
+            if not package or not livery:
+                messagebox.showerror("Missing livery", "Select an installed livery first.")
+                return
+
+            confirmed = messagebox.askyesno(
+                "Uninstall livery",
+                f"Remove this livery folder?\n\n{livery.aircraft_name}/{livery.name}\n\n{livery.path}",
+            )
+            if not confirmed:
+                return
+
+            try:
+                self.status_var.set("Uninstalling livery")
+                report = uninstall_livery(
+                    package,
+                    livery.path,
+                    backup_layout=self.backup_var.get(),
+                    allow_linked_targets=self.allow_linked_targets_var.get(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.status_var.set("Uninstall failed")
+                self.log(f"ERROR: {exc}")
+                messagebox.showerror("Uninstall failed", str(exc))
+                return
+
+            text = format_uninstall_report(report)
+            self.log(text)
+            self.refresh_installed_liveries()
+            self.update_product_views()
+            self.status_var.set("Uninstall complete")
+            messagebox.showinfo("Uninstall complete", text)
 
         def writable_status(self, path: Path) -> str:
             if not path.exists():
@@ -1457,8 +2109,11 @@ def launch_gui() -> None:
             community = self.community_var.get().strip()
             if not community:
                 self.package_combo["values"] = []
+                if hasattr(self, "installed_package_combo"):
+                    self.installed_package_combo["values"] = []
                 self.detected_packages = []
                 self.update_product_views()
+                self.refresh_installed_liveries()
                 self.package_count_var.set("0 products detected")
                 self.status_var.set("Select a Community folder")
                 return
@@ -1472,6 +2127,8 @@ def launch_gui() -> None:
                 self.package_paths[label] = package
                 values.append(label)
             self.package_combo["values"] = values
+            if hasattr(self, "installed_package_combo"):
+                self.installed_package_combo["values"] = values
             if values and self.package_var.get() not in values:
                 self.package_var.set(values[0])
             if not values:
@@ -1479,6 +2136,7 @@ def launch_gui() -> None:
             noun = "product" if len(values) == 1 else "products"
             self.package_count_var.set(f"{len(values)} {noun} detected")
             self.update_product_views()
+            self.refresh_installed_liveries()
             self.status_var.set("PMDG product scan complete")
             self.log(f"Found {len(values)} PMDG package(s).")
 
@@ -1534,6 +2192,8 @@ def launch_gui() -> None:
 
             text = format_report(report)
             self.log(text)
+            self.refresh_installed_liveries()
+            self.update_product_views()
             self.status_var.set("Install complete")
             messagebox.showinfo("Install complete", text)
 
@@ -1549,6 +2209,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--package", help="PMDG package folder name, e.g. pmdg-aircraft-738.")
     parser.add_argument("--package-root", type=Path, help="Full PMDG package folder path.")
     parser.add_argument("--livery", type=Path, help="Livery ZIP or extracted livery folder.")
+    parser.add_argument("--list-liveries", action="store_true", help="List installed liveries for the selected PMDG package.")
+    parser.add_argument("--uninstall-livery", help="Uninstall an installed livery by folder name, Aircraft/Livery name, or full folder path.")
     parser.add_argument("--overwrite", action="store_true", help="Allow overwriting existing files.")
     parser.add_argument("--no-backup", action="store_true", help="Do not back up layout.json.")
     parser.add_argument("--allow-linked-targets", action="store_true", help="Allow writing into symlink/junction livery targets.")
@@ -1592,6 +2254,41 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.detect:
         print_detected_paths()
+        return 0
+
+    if args.list_liveries:
+        try:
+            package_root = resolve_package_from_args(args)
+            liveries = list_installed_liveries(package_root)
+        except InstallerError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        for livery in liveries:
+            print(
+                "\t".join(
+                    [
+                        livery.aircraft_name,
+                        livery.name,
+                        str(livery.path),
+                        str(livery.thumbnail_path or ""),
+                    ]
+                )
+            )
+        return 0
+
+    if args.uninstall_livery:
+        try:
+            package_root = resolve_package_from_args(args)
+            report = uninstall_livery(
+                package_root,
+                args.uninstall_livery,
+                backup_layout=not args.no_backup,
+                allow_linked_targets=args.allow_linked_targets,
+            )
+        except InstallerError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        print(format_uninstall_report(report))
         return 0
 
     if not args.livery:
