@@ -44,7 +44,7 @@ if (-not $iscc) {
 $isccPath = if ($iscc -is [System.IO.FileInfo]) { $iscc.FullName } else { $iscc.Source }
 & $isccPath $issPath
 
-$setupExe = Join-Path $root "release\PMDG Livery Installer MSFS2024 Setup v0.1.5.exe"
+$setupExe = Join-Path $root "release\PMDG Livery Installer MSFS2024 Setup v0.1.51.exe"
 if (-not (Test-Path -LiteralPath $setupExe)) {
   throw "Inno Setup did not produce the expected installer: $setupExe"
 }

@@ -1,5 +1,5 @@
 #define AppName "PMDG Livery Installer MSFS2024"
-#define AppVersion "0.1.5"
+#define AppVersion "0.1.51"
 #define AppExeName "PMDG Livery Installer MSFS2024.exe"
 #define AppPublisher "PMDG Livery Installer MSFS2024"
 

@@ -1045,6 +1045,7 @@ def launch_gui() -> None:
             "green": "#62d08c",
             "cyan": "#36b6cf",
             "blue": "#3578c6",
+            "blue_hover": "#4791db",
             "button": "#2d3935",
             "button_hover": "#3a4943",
         }
@@ -1083,7 +1084,7 @@ def launch_gui() -> None:
 
             self._build_ui()
             self.detect_paths()
-            self.show_page("Products")
+            self.show_page("Liveries")
 
         def color(self, name: str) -> str:
             return self.COLORS[name]
@@ -1129,6 +1130,14 @@ def launch_gui() -> None:
                 darkcolor=self.color("line_soft"),
                 arrowcolor=self.color("cyan"),
                 padding=5,
+            )
+            style.map(
+                "PMDG.TCombobox",
+                fieldbackground=[("readonly", self.color("field")), ("!disabled", self.color("field"))],
+                background=[("readonly", self.color("field")), ("!disabled", self.color("field"))],
+                foreground=[("readonly", self.color("text")), ("!disabled", self.color("text"))],
+                selectbackground=[("readonly", self.color("field"))],
+                selectforeground=[("readonly", self.color("text"))],
             )
             style.configure(
                 "PMDG.Treeview",
@@ -1190,14 +1199,6 @@ def launch_gui() -> None:
                 anchor="w",
             ).pack(anchor="w")
             tk.Label(
-                title_box,
-                text="Manual livery management for PMDG aircraft packages",
-                bg=self.color("top"),
-                fg=self.color("muted"),
-                font=("Segoe UI", 8),
-                anchor="w",
-            ).pack(anchor="w", pady=(2, 0))
-            tk.Label(
                 topbar,
                 textvariable=self.status_var,
                 bg=self.color("panel"),
@@ -1224,10 +1225,17 @@ def launch_gui() -> None:
                 anchor="w",
             ).pack(fill=tk.X, padx=14, pady=(14, 6))
 
+            nav_labels = {
+                "Products": "Products",
+                "Installed": "Manage",
+                "Liveries": "Install",
+                "Diagnostics": "Diagnostics",
+                "Settings": "Settings",
+            }
             for page_name in ("Products", "Installed", "Liveries", "Diagnostics", "Settings"):
                 nav = tk.Button(
                     sidebar,
-                    text=page_name,
+                    text=nav_labels[page_name],
                     command=lambda name=page_name: self.show_page(name),
                     bg=self.color("sidebar"),
                     activebackground=self.color("sidebar_active"),
@@ -1279,9 +1287,16 @@ def launch_gui() -> None:
                 anchor="w",
             )
 
-        def button(self, parent, text, command, accent=False):
-            bg = self.color("red") if accent else self.color("button")
-            active = self.color("red_hover") if accent else self.color("button_hover")
+        def button(self, parent, text, command, accent=False, danger=False):
+            if danger:
+                bg = self.color("red")
+                active = self.color("red_hover")
+            elif accent:
+                bg = self.color("blue")
+                active = self.color("blue_hover")
+            else:
+                bg = self.color("button")
+                active = self.color("button_hover")
             return tk.Button(
                 parent,
                 text=text,
@@ -1295,7 +1310,7 @@ def launch_gui() -> None:
                 padx=12,
                 pady=6,
                 cursor="hand2",
-                font=("Segoe UI", 9, "bold" if accent else "normal"),
+                font=("Segoe UI", 9, "bold" if accent or danger else "normal"),
             )
 
         def entry(self, parent, variable):
@@ -1313,16 +1328,47 @@ def launch_gui() -> None:
                 font=("Segoe UI", 9),
             )
 
+        def draw_round_rect(self, canvas, fill, outline=None, radius=14):
+            canvas.delete("module")
+            width = max(canvas.winfo_width(), 1)
+            height = max(canvas.winfo_height(), 1)
+            radius = min(radius, width // 2, height // 2)
+            outline = outline or fill
+            canvas.create_rectangle(radius, 0, width - radius, height, fill=fill, outline=fill, tags="module")
+            canvas.create_rectangle(0, radius, width, height - radius, fill=fill, outline=fill, tags="module")
+            canvas.create_oval(0, 0, radius * 2, radius * 2, fill=fill, outline=fill, tags="module")
+            canvas.create_oval(width - radius * 2, 0, width, radius * 2, fill=fill, outline=fill, tags="module")
+            canvas.create_oval(0, height - radius * 2, radius * 2, height, fill=fill, outline=fill, tags="module")
+            canvas.create_oval(width - radius * 2, height - radius * 2, width, height, fill=fill, outline=fill, tags="module")
+            canvas.create_arc(1, 1, radius * 2, radius * 2, start=90, extent=90, outline=outline, width=1, style=tk.ARC, tags="module")
+            canvas.create_arc(width - radius * 2, 1, width - 1, radius * 2, start=0, extent=90, outline=outline, width=1, style=tk.ARC, tags="module")
+            canvas.create_arc(1, height - radius * 2, radius * 2, height - 1, start=180, extent=90, outline=outline, width=1, style=tk.ARC, tags="module")
+            canvas.create_arc(width - radius * 2, height - radius * 2, width - 1, height - 1, start=270, extent=90, outline=outline, width=1, style=tk.ARC, tags="module")
+            canvas.create_line(radius, 1, width - radius, 1, fill=outline, width=1, tags="module")
+            canvas.create_line(radius, height - 1, width - radius, height - 1, fill=outline, width=1, tags="module")
+            canvas.create_line(1, radius, 1, height - radius, fill=outline, width=1, tags="module")
+            canvas.create_line(width - 1, radius, width - 1, height - radius, fill=outline, width=1, tags="module")
+            canvas.tag_lower("module")
+
         def card(self, parent, title, subtitle=None):
-            frame = tk.Frame(parent, bg=self.color("panel"), highlightthickness=0)
+            frame = tk.Frame(parent, bg=parent["bg"], highlightthickness=0)
             frame.columnconfigure(0, weight=1)
             frame.rowconfigure(2, weight=1)
-            tk.Frame(frame, bg=self.color("cyan"), height=1).grid(row=0, column=0, sticky="ew")
+            background = tk.Canvas(frame, bg=parent["bg"], highlightthickness=0, bd=0)
+            background.place(x=0, y=0, relwidth=1, relheight=1)
+            background.bind(
+                "<Configure>",
+                lambda _event, canvas=background: self.draw_round_rect(
+                    canvas,
+                    self.color("panel"),
+                    self.color("line_soft"),
+                ),
+            )
             header = tk.Frame(frame, bg=self.color("panel"))
-            header.grid(row=1, column=0, sticky="ew", padx=12, pady=(8, 4))
+            header.grid(row=1, column=0, sticky="ew", padx=16, pady=(12, 4))
             self.label(header, title, 10, self.color("text"), "bold").pack(anchor="w")
             content = tk.Frame(frame, bg=self.color("panel"))
-            content.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+            content.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
             content.columnconfigure(0, weight=1)
             return frame, content
 
@@ -1346,7 +1392,7 @@ def launch_gui() -> None:
             content.columnconfigure(0, weight=1)
             content.columnconfigure(1, weight=2)
 
-            summary_card, summary = self.card(content, "Product Library", "Community packages that look like PMDG aircraft products.")
+            summary_card, summary = self.card(content, "Detect Products", "Community packages that look like PMDG aircraft products.")
             summary_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
             summary.columnconfigure(0, weight=1)
             tk.Label(
@@ -1362,7 +1408,7 @@ def launch_gui() -> None:
             self.button(actions, "Detect Paths", self.detect_paths).pack(side=tk.LEFT)
             self.button(actions, "Refresh Products", self.refresh_packages, accent=True).pack(side=tk.LEFT, padx=(10, 0))
 
-            list_card, list_body = self.card(content, "Installed Products", "Select a product to view package details.")
+            list_card, list_body = self.card(content, "Product List", "Select a product to view package details.")
             list_card.grid(row=1, column=0, sticky="nsew", padx=(0, 7))
             list_card.rowconfigure(1, weight=1)
             list_body.rowconfigure(0, weight=1)
@@ -1414,7 +1460,7 @@ def launch_gui() -> None:
             content.columnconfigure(1, weight=2)
             content.rowconfigure(1, weight=1)
 
-            package_card, package = self.card(content, "Aircraft Package", "Choose a PMDG product and scan its installed livery package.")
+            package_card, package = self.card(content, "Select Aircraft", "Choose a PMDG product and scan its installed livery package.")
             package_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
             package.columnconfigure(0, weight=1)
             self.installed_package_combo = ttk.Combobox(package, textvariable=self.package_var, state="readonly", style="PMDG.TCombobox")
@@ -1423,7 +1469,7 @@ def launch_gui() -> None:
             self.button(package, "Refresh Products", self.refresh_packages).grid(row=0, column=1, padx=(0, 8))
             self.button(package, "Scan Liveries", self.refresh_installed_liveries, accent=True).grid(row=0, column=2)
 
-            list_card, list_body = self.card(content, "Installed Liveries", "Select a livery to inspect its files and thumbnail.")
+            list_card, list_body = self.card(content, "Select Livery", "Select a livery to inspect its files and thumbnail.")
             list_card.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
             list_card.rowconfigure(1, weight=1)
             list_body.rowconfigure(0, weight=1)
@@ -1451,7 +1497,7 @@ def launch_gui() -> None:
             self.installed_tree.configure(yscrollcommand=installed_scrollbar.set)
             self.installed_tree.bind("<<TreeviewSelect>>", self.on_installed_livery_select)
 
-            preview_card, preview = self.card(content, "Preview", "Thumbnail, metadata and uninstall controls for the selected livery.")
+            preview_card, preview = self.card(content, "Preview & Actions", "Thumbnail, metadata and uninstall controls for the selected livery.")
             preview_card.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
             preview_card.rowconfigure(1, weight=1)
             preview.columnconfigure(0, weight=1)
@@ -1495,26 +1541,31 @@ def launch_gui() -> None:
             actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
             self.button(actions, "Copy Path", self.copy_installed_livery_path).pack(side=tk.LEFT)
             self.button(actions, "Refresh", self.refresh_installed_liveries).pack(side=tk.LEFT, padx=(10, 0))
-            self.button(actions, "Uninstall Selected", self.uninstall_selected_livery, accent=True).pack(side=tk.RIGHT)
+            self.button(actions, "Uninstall Selected", self.uninstall_selected_livery, danger=True).pack(side=tk.RIGHT)
             return page
 
         def _create_liveries_page(self):
-            page = self.make_page("Liveries", "Install third-party PMDG livery packages without using PMDG OC3.")
+            page = self.make_page("Install", "Install third-party PMDG livery packages without using PMDG OC3.")
             page.rowconfigure(1, weight=1)
             content = tk.Frame(page, bg=self.color("bg"))
             content.grid(row=1, column=0, sticky="nsew")
             content.columnconfigure(0, weight=1)
-            content.columnconfigure(1, weight=1)
-            content.rowconfigure(3, weight=1)
+            content.rowconfigure(2, weight=1)
 
-            paths_card, paths = self.card(content, "Simulator Paths", "Detected automatically; override when needed.")
+            steps = tk.Frame(content, bg=self.color("bg"))
+            steps.grid(row=0, column=0, sticky="ew")
+            steps.columnconfigure(0, weight=1, uniform="install_steps")
+            steps.columnconfigure(1, weight=1, uniform="install_steps")
+
+            paths_card, paths = self.card(steps, "Community Folder", "Detected automatically; override when needed.")
             paths_card.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))
             paths.columnconfigure(1, weight=1)
-            self.label(paths, "Community folder", 8, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(2, 4))
+            self.label(paths, "Community", 8, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(2, 4))
             self.entry(paths, self.community_var).grid(row=0, column=1, sticky="ew", pady=(2, 4), ipady=4)
             self.button(paths, "Browse", self.choose_community).grid(row=0, column=2, padx=(8, 0), pady=(2, 4))
+            self.button(paths, "Detect Paths", self.detect_paths).grid(row=1, column=1, columnspan=2, sticky="e", pady=(4, 0))
 
-            package_card, package = self.card(content, "Aircraft Package", "Choose the PMDG product to receive the livery.")
+            package_card, package = self.card(steps, "Aircraft Package", "Choose the PMDG product to receive the livery.")
             package_card.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=(0, 8))
             package.columnconfigure(0, weight=1)
             tk.Label(
@@ -1529,27 +1580,30 @@ def launch_gui() -> None:
             self.package_combo.grid(row=1, column=0, sticky="ew", padx=(0, 6), ipady=2)
             self.button(package, "Refresh", self.refresh_packages).grid(row=1, column=1)
 
-            install_card, install = self.card(content, "Livery Package", "Select a ZIP or extracted livery folder.")
-            install_card.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-            install.columnconfigure(1, weight=1)
-            self.label(install, "Source", 8, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(0, 8))
-            self.entry(install, self.livery_var).grid(row=0, column=1, sticky="ew", pady=(0, 8), ipady=4)
-            browse_menu = tk.Frame(install, bg=self.color("panel"))
-            browse_menu.grid(row=0, column=2, sticky="e", padx=(8, 0), pady=(0, 8))
+            source_card, source = self.card(steps, "Livery Source", "Select a ZIP or extracted livery folder.")
+            source_card.grid(row=1, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))
+            source.columnconfigure(1, weight=1)
+            self.label(source, "Source", 8, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(2, 4))
+            self.entry(source, self.livery_var).grid(row=0, column=1, sticky="ew", pady=(2, 4), ipady=4)
+            browse_menu = tk.Frame(source, bg=self.color("panel"))
+            browse_menu.grid(row=1, column=1, sticky="e", pady=(4, 0))
             self.button(browse_menu, "ZIP", self.choose_zip).pack(side=tk.LEFT)
             self.button(browse_menu, "Folder", self.choose_livery_folder).pack(side=tk.LEFT, padx=(8, 0))
+
+            install_card, install = self.card(steps, "Install Options", "Overwrite, backup and install.")
+            install_card.grid(row=1, column=1, sticky="nsew", padx=(5, 0), pady=(0, 8))
+            install.columnconfigure(0, weight=1)
             options = tk.Frame(install, bg=self.color("panel"))
-            options.grid(row=1, column=1, sticky="w")
-            self.checkbutton(options, "Allow overwrite", self.overwrite_var).pack(side=tk.LEFT)
-            self.checkbutton(options, "Backup layout.json", self.backup_var).pack(side=tk.LEFT, padx=(12, 0))
-            self.checkbutton(options, "Allow linked targets", self.allow_linked_targets_var).pack(side=tk.LEFT, padx=(12, 0))
+            options.grid(row=0, column=0, sticky="w")
+            self.checkbutton(options, "Allow overwrite", self.overwrite_var).grid(row=0, column=0, sticky="w")
+            self.checkbutton(options, "Backup layout.json", self.backup_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
+            self.checkbutton(options, "Allow linked targets", self.allow_linked_targets_var).grid(row=2, column=0, sticky="w", pady=(4, 0))
             action_bar = tk.Frame(install, bg=self.color("panel"))
-            action_bar.grid(row=1, column=2, sticky="e", padx=(8, 0))
-            self.button(action_bar, "Detect Paths", self.detect_paths).pack(side=tk.LEFT)
-            self.button(action_bar, "Install Livery", self.install_selected, accent=True).pack(side=tk.LEFT, padx=(8, 0))
+            action_bar.grid(row=1, column=0, sticky="e", pady=(8, 0))
+            self.button(action_bar, "Install Livery", self.install_selected, accent=True).pack(side=tk.LEFT)
 
             log_card, log_body = self.card(content, "Activity Log", "Detection, copy, layout rebuild and install results.")
-            log_card.grid(row=3, column=0, columnspan=2, sticky="nsew")
+            log_card.grid(row=2, column=0, sticky="nsew")
             log_card.rowconfigure(1, weight=1)
             log_body.rowconfigure(0, weight=1)
             self.log_text = tk.Text(
@@ -1656,7 +1710,8 @@ def launch_gui() -> None:
                     fg=self.color("cyan") if active else "#c4ccd5",
                     font=("Segoe UI", 10, "bold" if active else "normal"),
                 )
-            self.status_var.set(f"{page_name} ready")
+            status_name = {"Installed": "Manage", "Liveries": "Install"}.get(page_name, page_name)
+            self.status_var.set(f"{status_name} ready")
 
         def set_text(self, widget, text: str) -> None:
             widget.configure(state=tk.NORMAL)
