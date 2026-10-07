@@ -3,15 +3,15 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
-$iconPath = Join-Path $root "assets\pmdg_livery_installer_icon.ico"
-if (-not (Test-Path -LiteralPath $iconPath)) {
-  python .\build_icon.py
-  if ($LASTEXITCODE -ne 0) {
-    throw "Icon generation failed. Install Pillow or provide assets\pmdg_livery_installer_icon.ico."
-  }
-}
-
 $env:PYTHONPATH = Join-Path $root ".build_tools"
+python -c "import PIL; import PyInstaller"
+if ($LASTEXITCODE -ne 0) {
+  throw "Build dependencies missing. Run: python -m pip install --target .build_tools -r requirements-build.txt"
+}
+python .\build_icon.py
+if ($LASTEXITCODE -ne 0) { throw "Icon generation failed." }
+python .\tools\write_version_info.py
+if ($LASTEXITCODE -ne 0) { throw "Version metadata generation failed." }
 python .\tools\run_pyinstaller_fixed_temp.py `
   --noconfirm `
   --clean `
@@ -19,8 +19,8 @@ python .\tools\run_pyinstaller_fixed_temp.py `
   --windowed `
   --name "PMDG Livery Installer MSFS2024" `
   --icon ".\assets\pmdg_livery_installer_icon.ico" `
-  --add-data ".\assets\pmdg_livery_installer_icon.ico;assets" `
-  --add-data ".\assets\MSFSLayoutGenerator.exe;assets" `
+  --version-file ".\build\version_info.txt" `
+  --add-data ".\assets;assets" `
   .\pmdg_livery_installer.py
 
 if ($LASTEXITCODE -ne 0) {

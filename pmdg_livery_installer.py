@@ -2,14 +2,14 @@
 """
 PMDG Livery Installer for MSFS 2024.
 
-Installs MSFS 2024 PMDG livery ZIP/folder packages without PMDG OC3 by
-copying the livery files into an existing PMDG aircraft package and rebuilding
-layout.json.
+Installs and manages MSFS 2024 PMDG livery ZIP/folder packages without PMDG
+OC3, using verified companion-package transactions and recovery backups.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import re
@@ -19,10 +19,18 @@ import sys
 import time
 import uuid
 import zipfile
+import queue
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Iterable
+
+from livery_workflow import (
+    InstallerError, OperationCancelled, OperationControl, PackageTransaction,
+    backup_directory, checkpoint, copy_file, copy_tree, inventory, linked,
+    operation_context, plain_tree, write_json,
+)
 
 
 WINDOWS_FILETIME_EPOCH_OFFSET = 11644473600
@@ -50,10 +58,6 @@ KNOWN_PMDG_AIRCRAFT_FOLDERS = {
 }
 
 
-class InstallerError(RuntimeError):
-    """Raised for user-fixable installer failures."""
-
-
 @dataclass
 class InstallReport:
     package_root: Path
@@ -64,6 +68,8 @@ class InstallReport:
     manifest_updated: bool = False
     backup_path: Path | None = None
     installed_roots: list[Path] = field(default_factory=list)
+    recovery_path: Path | None = None
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -98,6 +104,27 @@ class UninstallReport:
     layout_entries: int = 0
     manifest_updated: bool = False
     backup_path: Path | None = None
+    recovery_path: Path | None = None
+
+
+@dataclass
+class InstallPlan:
+    target: Path
+    files: list[tuple[Path, Path]]
+    liveries: list[str]
+    conflicts: list[str]
+    warnings: list[str]
+    total_size: int
+    source_package: Path | None = None
+    preview_png: bytes | None = None
+
+
+@dataclass(frozen=True)
+class CommunityCandidate:
+    path: Path
+    configs: tuple[Path, ...]
+    products: tuple[str, ...]
+    writable: bool
 
 
 def normalize_path(value: str | Path) -> Path:
@@ -144,8 +171,8 @@ def parse_installed_packages_path(user_cfg: Path) -> Path | None:
 
 
 def detect_msfs2024_paths() -> DetectedPaths:
-    local_appdata = Path(os.environ.get("LOCALAPPDATA", ""))
-    appdata = Path(os.environ.get("APPDATA", ""))
+    local_appdata = Path(os.environ["LOCALAPPDATA"]) if os.environ.get("LOCALAPPDATA") else None
+    appdata = Path(os.environ["APPDATA"]) if os.environ.get("APPDATA") else None
 
     user_cfg_candidates: list[Path] = []
     if local_appdata:
@@ -183,11 +210,12 @@ def detect_msfs2024_paths() -> DetectedPaths:
 
 def find_pmdg_packages(community_path: Path) -> list[Path]:
     community_path = normalize_path(community_path)
-    if not community_path.exists():
+    if not community_path.is_dir():
         return []
 
     packages: list[Path] = []
     for child in community_path.iterdir():
+        checkpoint(f"Scanning product: {child.name}")
         if not child.is_dir():
             continue
         name = child.name.lower()
@@ -217,7 +245,7 @@ def find_pmdg_product_roots(community_path: Path) -> list[Path]:
     for package in find_pmdg_packages(community_path):
         product_roots[package.name.lower()] = package
 
-    if community_path.exists():
+    if community_path.is_dir():
         for child in community_path.iterdir():
             if not child.is_dir():
                 continue
@@ -240,9 +268,13 @@ def validate_package_root(package_root: Path) -> Path:
 
 
 def validate_selected_package_root(package_root: Path) -> Path:
-    package_root = normalize_path(package_root)
+    # Keep the Community alias until linked-target policy has been checked.
+    package_root = Path(os.path.abspath(os.path.expandvars(os.path.expanduser(str(package_root)))))
     if package_root.exists():
-        return validate_package_root(package_root)
+        if package_root.name.lower().endswith("-liveries") and (package_root / "SimObjects").is_dir():
+            return package_root
+        validate_package_root(package_root)
+        return package_root
     if known_airplane_folder_name(package_root) and package_root.parent.exists():
         return package_root
     raise InstallerError(f"PMDG package folder does not exist: {package_root}")
@@ -293,19 +325,28 @@ def safe_extract_archive(archive_path: Path, target_dir: Path) -> None:
     try:
         with zipfile.ZipFile(archive_path) as archive:
             for item in archive.infolist():
+                checkpoint(f"Extracting: {item.filename}")
                 raw_name = item.filename.replace("\\", "/")
                 rel = PurePosixPath(raw_name)
-                if rel.is_absolute() or ".." in rel.parts:
+                if (rel.is_absolute() or ".." in rel.parts or
+                        any(":" in part or part.endswith((".", " ")) for part in rel.parts) or
+                        ((item.external_attr >> 16) & 0o170000) == 0o120000):
                     raise InstallerError(f"Unsafe path in ZIP: {item.filename}")
                 if not rel.name:
                     continue
                 destination = target_dir.joinpath(*rel.parts)
+                if not is_relative_to_path(destination.resolve(), target_dir.resolve()):
+                    raise InstallerError(f"Unsafe path in ZIP: {item.filename}")
                 if item.is_dir():
                     destination.mkdir(parents=True, exist_ok=True)
                     continue
                 destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists():
+                    raise InstallerError(f"Duplicate file in ZIP: {item.filename}")
                 with archive.open(item) as source, destination.open("wb") as dest:
-                    shutil.copyfileobj(source, dest)
+                    while chunk := source.read(1024 * 1024):
+                        checkpoint(f"Extracting: {item.filename}")
+                        dest.write(chunk)
     except zipfile.BadZipFile as exc:
         raise InstallerError(f"Not a valid ZIP file: {archive_path}") from exc
 
@@ -348,11 +389,15 @@ def temporary_workspace(package_root: Path) -> Iterable[Path]:
             probe = nested_probe / ".write-test"
             probe.write_text("ok", encoding="utf-8")
             probe.unlink()
-            yield tmp_path
-            return
         except OSError as exc:
             last_error = exc
+            shutil.rmtree(tmp_path, ignore_errors=True)
             continue
+        # Do not catch an OSError raised by the caller at yield and retry the
+        # operation in another temporary directory.
+        try:
+            yield tmp_path
+            return
         finally:
             if tmp_path.exists():
                 shutil.rmtree(tmp_path, ignore_errors=True)
@@ -362,6 +407,7 @@ def temporary_workspace(package_root: Path) -> Iterable[Path]:
 
 def iter_dirs(root: Path) -> Iterable[Path]:
     for current, dirnames, _ in os.walk(root):
+        checkpoint(f"Inspecting: {Path(current).name}")
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         yield Path(current)
 
@@ -403,6 +449,7 @@ def count_folder_contents(root: Path) -> tuple[int, int, int]:
     folder_count = 0
     total_size = 0
     for current, dirnames, filenames in os.walk(root):
+        checkpoint(f"Scanning livery files: {Path(current).name}")
         folder_count += len(dirnames)
         current_path = Path(current)
         for filename in filenames:
@@ -481,6 +528,7 @@ def list_installed_liveries(package_root: Path) -> list[InstalledLivery]:
     livery_package_root = ensure_livery_package_root(selected_package_root)
     if not livery_package_root.exists():
         return []
+    plain_tree(livery_package_root.resolve())
 
     liveries: list[InstalledLivery] = []
     for livery_parent in livery_parent_roots(livery_package_root):
@@ -553,8 +601,13 @@ def uninstall_livery(
     backup_layout: bool = True,
     allow_linked_targets: bool = False,
 ) -> UninstallReport:
+    return uninstall_liveries(package_root, [livery_identifier], backup_layout, allow_linked_targets)[0]
+
+
+def uninstall_liveries(package_root: Path, identifiers: list[str | Path],
+                       backup_layout: bool = True, allow_linked_targets: bool = False) -> list[UninstallReport]:
     selected_package_root = validate_selected_package_root(package_root)
-    livery_package_root = ensure_livery_package_root(selected_package_root)
+    livery_package_root = checked_livery_target(selected_package_root, allow_linked_targets)
     if not livery_package_root.exists():
         raise InstallerError(f"Livery package does not exist: {livery_package_root}")
     if is_reparse_point(livery_package_root) and not allow_linked_targets:
@@ -563,35 +616,29 @@ def uninstall_livery(
             "Uninstall is blocked by default to avoid deleting files from a linked source folder."
         )
 
-    livery = resolve_installed_livery(selected_package_root, livery_identifier)
-    livery_root = normalize_path(livery.path)
-    if is_reparse_point(livery_root):
-        raise InstallerError("The selected livery folder is a symlink/junction/reparse-point and was not removed.")
-    if not livery_root.exists() or not livery_root.is_dir():
-        raise InstallerError(f"Installed livery folder does not exist: {livery_root}")
-
-    file_count, folder_count, total_size = count_folder_contents(livery_root)
-    try:
-        shutil.rmtree(livery_root)
-    except OSError as exc:
-        raise InstallerError(f"Could not remove livery folder: {exc}") from exc
-
-    layout_entries, manifest_updated, backup_path = rebuild_layout(
-        livery_package_root,
-        backup=backup_layout,
-    )
-    return UninstallReport(
-        package_root=livery_package_root,
-        livery_path=livery_root,
-        aircraft_name=livery.aircraft_name,
-        livery_name=livery.name,
-        removed_files=file_count,
-        removed_dirs=folder_count,
-        removed_size=total_size,
-        layout_entries=layout_entries,
-        manifest_updated=manifest_updated,
-        backup_path=backup_path,
-    )
+    liveries = {str(livery.path.resolve()): livery for identifier in identifiers
+                for livery in [resolve_installed_livery(selected_package_root, identifier)]}
+    if not liveries:
+        raise InstallerError("Select at least one installed livery.")
+    with PackageTransaction(livery_package_root, "uninstall") as transaction:
+        for livery in liveries.values():
+            relative = livery.path.resolve().relative_to(livery_package_root)
+            staged_livery = transaction.stage / relative
+            if not is_relative_to_path(staged_livery.resolve(), transaction.stage.resolve()) or len(relative.parts) != 6:
+                raise InstallerError("The selected folder is not a single installed livery.")
+            checkpoint(f"Removing from staged package: {livery.name}", force=True)
+            shutil.rmtree(staged_livery)
+        layout_entries, manifest_updated, backup_path = rebuild_layout(transaction.stage, backup=backup_layout)
+        recovery = transaction.commit()
+    if backup_path:
+        backup_path = livery_package_root / backup_path.name
+    return [UninstallReport(
+        package_root=livery_package_root, livery_path=livery.path,
+        aircraft_name=livery.aircraft_name, livery_name=livery.name,
+        removed_files=livery.file_count, removed_dirs=livery.folder_count,
+        removed_size=livery.total_size, layout_entries=layout_entries,
+        manifest_updated=manifest_updated, backup_path=backup_path, recovery_path=recovery,
+    ) for livery in liveries.values()]
 
 
 def get_single_airplane_folder(package_root: Path) -> Path:
@@ -615,15 +662,18 @@ def get_single_airplane_folder(package_root: Path) -> Path:
 
 
 def get_airplane_folder_name(selected_package_root: Path, livery_package_root: Path) -> str:
+    if selected_package_root.exists() and not selected_package_root.name.lower().endswith("-liveries"):
+        # Actual installed aircraft/variant folders take precedence over the
+        # generic fallback used for virtual (Marketplace/streamed) products.
+        return get_single_airplane_folder(selected_package_root).name
+    known_folder = known_airplane_folder_name(selected_package_root)
+    if known_folder:
+        return known_folder
     livery_airplanes = livery_package_root / "SimObjects" / "Airplanes"
     if livery_airplanes.exists():
         livery_folders = [p for p in livery_airplanes.iterdir() if p.is_dir()]
         if len(livery_folders) == 1:
             return livery_folders[0].name
-
-    known_folder = known_airplane_folder_name(selected_package_root)
-    if known_folder:
-        return known_folder
 
     selected_airplane = get_single_airplane_folder(selected_package_root)
     return selected_airplane.name
@@ -749,6 +799,7 @@ def windows_filetime(path: Path) -> int:
 
 def iter_layout_files(package_root: Path) -> Iterable[Path]:
     for current, dirnames, filenames in os.walk(package_root):
+        checkpoint(f"Checking layout files: {Path(current).name}")
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         current_path = Path(current)
         for filename in filenames:
@@ -801,38 +852,215 @@ def rebuild_layout(package_root: Path, backup: bool = True) -> tuple[int, bool, 
     layout_path = package_root / "layout.json"
     backup_path: Path | None = None
 
-    if backup and layout_path.exists():
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        backup_path = package_root / f"layout.json.bak-{timestamp}"
-        shutil.copy2(layout_path, backup_path)
-
-    stale_generator = package_root / "MSFSLayoutGenerator.exe"
-    if stale_generator.exists():
-        stale_generator.unlink()
-
+    original_layout = layout_path.read_bytes()
+    checkpoint("Rebuilding livery package index", force=True)
     generator_path = layout_generator_path()
     try:
-        subprocess.run(
+        process = subprocess.Popen(
             [str(generator_path), str(layout_path)],
             cwd=str(package_root),
-            check=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
         )
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or exc.stdout or "").strip()
-        if detail:
-            raise InstallerError(f"MSFSLayoutGenerator failed: {detail}") from exc
-        raise InstallerError(f"MSFSLayoutGenerator failed with exit code {exc.returncode}") from exc
+        try:
+            deadline = time.monotonic() + 120
+            while True:
+                checkpoint("Rebuilding livery package index (up to 120 seconds)")
+                try:
+                    stdout, stderr = process.communicate(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        raise InstallerError("Layout generator timed out after 120 seconds. The active package was not changed.")
+            if process.returncode:
+                raise InstallerError(f"MSFSLayoutGenerator failed ({process.returncode}): {(stderr or stdout).strip()}")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        entry_count, total_size = validate_layout(package_root)
+        generated = json.loads(layout_path.read_text(encoding="utf-8-sig"))
+        generated["content"] = [entry for entry in generated["content"]
+                                if not (len(PurePosixPath(entry["path"].replace("\\", "/")).parts) == 1
+                                        and should_skip_root_item(Path(entry["path"])))]
+        write_json(layout_path, generated)
+        manifest_updated = update_manifest_size(package_root, total_size)
+        if backup:
+            timestamp = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+            backup_path = package_root / f"layout.json.bak-{timestamp}"
+            backup_path.write_bytes(original_layout)
+        return entry_count, manifest_updated, backup_path
+    except BaseException:
+        layout_path.write_bytes(original_layout)
+        raise
 
+
+def validate_layout(package_root: Path) -> tuple[int, int]:
+    checkpoint("Validating generated index against package files", force=True)
     try:
-        data = json.loads(layout_path.read_text(encoding="utf-8-sig"))
-        content = data.get("content", [])
-        entry_count = len(content) if isinstance(content, list) else 0
-    except (OSError, json.JSONDecodeError):
-        entry_count = 0
-    return entry_count, False, backup_path
+        layout = json.loads((package_root / "layout.json").read_text(encoding="utf-8-sig"))
+        manifest = json.loads((package_root / "manifest.json").read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise InstallerError(f"Package JSON is missing or unreadable: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise InstallerError("manifest.json must contain a JSON object.")
+    if not isinstance(layout, dict) or not isinstance(layout.get("content"), list):
+        raise InstallerError("layout.json must contain a content array.")
+    actual = {}
+    for entry in layout["content"]:
+        checkpoint()
+        if (not isinstance(entry, dict) or not isinstance(entry.get("path"), str)
+                or type(entry.get("size")) is not int or entry["size"] < 0
+                or type(entry.get("date")) is not int or entry["date"] < 0):
+            raise InstallerError("layout.json contains an invalid file entry.")
+        name = entry["path"].replace("\\", "/")
+        rel = PurePosixPath(name)
+        if rel.is_absolute() or ".." in rel.parts or ":" in name or not rel.parts:
+            raise InstallerError(f"layout.json contains an unsafe path: {name}")
+        key = rel.as_posix().casefold()
+        if key in actual:
+            raise InstallerError(f"layout.json contains a duplicate entry: {name}")
+        # The bundled generator can list old layout backups; they are metadata,
+        # not livery content, and are excluded from the saved index below.
+        if len(rel.parts) == 1 and should_skip_root_item(Path(name)):
+            continue
+        actual[key] = entry["size"]
+    expected = {str(entry["path"]).casefold(): entry["size"] for entry in build_layout_content(package_root)}
+    missing = sorted(expected.keys() - actual.keys())
+    stale = sorted(actual.keys() - expected.keys())
+    changed = sorted(key for key in expected.keys() & actual.keys() if expected[key] != actual[key])
+    if missing or stale or changed:
+        parts = []
+        for label, paths in (("Missing index entries", missing), ("Files missing from disk", stale), ("File size differs (modified, not necessarily damaged)", changed)):
+            if paths:
+                parts.append(f"{label}: {len(paths)}; {paths[0]}")
+        raise InstallerError("; ".join(parts) + ". Review changes, then rebuild the livery layout.")
+    return len(actual), sum(actual.values())
+
+
+def rebuild_livery_layout(package_root: Path, backup: bool = True, allow_linked_targets: bool = False):
+    target = checked_livery_target(package_root, allow_linked_targets)
+    if not target.is_dir():
+        raise InstallerError(f"No companion livery package exists yet: {target}. Install a livery first.")
+    with PackageTransaction(target, "rebuild layout") as transaction:
+        # A missing index is repairable; a missing manifest is not invented here.
+        if not (transaction.stage / "layout.json").exists():
+            write_json(transaction.stage / "layout.json", {"content": []})
+        result = rebuild_layout(transaction.stage, backup)
+        recovery = transaction.commit()
+    return target, result[0], result[1], recovery
+
+
+def restore_package_backup(package_root: Path, backup: Path, allow_linked_targets: bool = False):
+    target = checked_livery_target(package_root, allow_linked_targets)
+    backup = normalize_path(backup)
+    plain_tree(backup)
+    try:
+        record = json.loads((backup / "recovery.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise InstallerError("Choose a backup folder containing recovery.json and package/.") from exc
+    if not isinstance(record, dict) or record.get("format") != 1 or normalize_path(record.get("target", "")) != target:
+        raise InstallerError("This backup belongs to a different package/location. Select its original aircraft and Community folder.")
+    source = backup / "package"
+    if not source.is_dir() or not (source / "SimObjects").is_dir():
+        raise InstallerError("The backup has no recoverable package files.")
+    with PackageTransaction(target, "restore backup") as transaction:
+        shutil.rmtree(transaction.stage)
+        copy_tree(source, transaction.stage)
+        if not (transaction.stage / "layout.json").exists():
+            write_json(transaction.stage / "layout.json", {"content": []})
+        rebuild_layout(transaction.stage)
+        recovery = transaction.commit()
+    return f"Restored: {target}\nBackup used: {backup}\nPrevious state backup: {recovery or 'No previous package'}"
+
+
+def export_liveries(package_root: Path, identifiers: list[str | Path], destination: Path) -> Path:
+    target = ensure_livery_package_root(package_root).resolve()
+    destination = Path(os.path.abspath(destination))
+    if is_relative_to_path(destination.resolve(), target):
+        raise InstallerError("Save the export outside the livery package.")
+    liveries = [resolve_installed_livery(package_root, identifier) for identifier in identifiers]
+    if not liveries:
+        raise InstallerError("Select at least one livery to export.")
+    temporary = destination.with_name(destination.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+            for livery in liveries:
+                plain_tree(livery.path)
+                for path in livery.path.rglob("*"):
+                    if path.is_file():
+                        checkpoint(f"Exporting: {livery.name}/{path.name}")
+                        relative = path.resolve().relative_to(target)
+                        with path.open("rb") as source, archive.open(relative.as_posix(), "w", force_zip64=True) as output:
+                            while block := source.read(1024 * 1024):
+                                checkpoint(f"Exporting: {path.name}")
+                                output.write(block)
+        checkpoint("Saving livery export", force=True)
+        temporary.replace(destination)
+        return destination
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def community_candidates() -> list[CommunityCandidate]:
+    detected = detect_msfs2024_paths()
+    candidates = []
+    for community in detected.community_paths:
+        checkpoint(f"Inspecting Community: {community}")
+        configs = tuple(cfg for cfg in detected.user_cfg_paths
+                        if parse_installed_packages_path(cfg) == community.parent.resolve())
+        products = tuple(path.name for path in find_pmdg_product_roots(community))
+        candidates.append(CommunityCandidate(community, configs, products, os.access(community, os.W_OK)))
+    return candidates
+
+
+def filter_liveries(liveries: list[InstalledLivery], query: str = "", thumbnail_filter: str = "All") -> list[InstalledLivery]:
+    words = query.casefold().split()
+    return [livery for livery in liveries
+            if all(word in " ".join([livery.name, livery.aircraft_name, *livery.metadata.values()]).casefold() for word in words)
+            and (thumbnail_filter != "Missing thumbnail" or livery.thumbnail_path is None)]
+
+
+def diagnose_package(package_root: Path, allow_linked_targets: bool = False) -> str:
+    lines = ["PMDG Livery Installer MSFS2024 Diagnostics", f"Selected aircraft: {package_root}"]
+    try:
+        target = ensure_livery_package_root(package_root)
+        lines.append(f"Companion livery package: {target}")
+        real = checked_livery_target(package_root, allow_linked_targets)
+        if real != target:
+            lines.append(f"Real location: {real}")
+        lines.append("PASS: Target path/link policy checked.")
+        if not real.exists():
+            lines.append("UNKNOWN: No livery package exists. Install a compatible livery before repairing.")
+            return "\n".join(lines)
+        lines.append("PASS: Folder permits writing (OS estimate)." if os.access(real, os.W_OK) else "FAIL: Folder is not writable. Choose the correct Community folder or fix its permissions.")
+        try:
+            entries, size = validate_layout(real)
+            lines.append(f"PASS: Index matches {entries} files ({format_bytes(size)}).")
+        except InstallerError as exc:
+            lines.append(f"FAIL: {exc}")
+        liveries = list_installed_liveries(package_root)
+        lines.append(f"PASS: {len(liveries)} livery folders recognized in the companion package.")
+        missing = sum(livery.thumbnail_path is None for livery in liveries)
+        if missing:
+            lines.append(f"INFO: {missing} liveries have no supported thumbnail. This does not establish that the livery is damaged.")
+        snapshots = backup_directory(real)
+        count = len(list(snapshots.glob("*/recovery.json"))) if snapshots.exists() else 0
+        lines.append(f"Recovery backups: {count}; {snapshots}")
+        lines.append("UNKNOWN: Simulator loading and winglet/engine compatibility require checking the download description and MSFS 2024.")
+        lines.append("Action: Rebuild livery layout repairs the index only. It does not replace modified texture/config files. Restore backup replaces the whole companion package.")
+    except (InstallerError, OSError) as exc:
+        lines.append(f"FAIL: {exc}")
+    return "\n".join(lines)
+
+
+def redact_report(text: str, paths: list[Path]) -> str:
+    for index, path in enumerate(sorted({str(p) for p in paths if str(p)}, key=len, reverse=True), 1):
+        text = re.sub(re.escape(path), lambda _match, i=index: f"<PATH_{i}>", text, flags=re.I)
+        text = re.sub(re.escape(path.replace("\\", "/")), lambda _match, i=index: f"<PATH_{i}>", text, flags=re.I)
+    return text
 
 
 def layout_generator_path() -> Path:
@@ -858,8 +1086,6 @@ def validate_install_safety(
         input_root = input_root.parent
     source_root = normalize_path(source_root)
     selected_package_root = normalize_path(selected_package_root)
-    livery_package_root = normalize_path(livery_package_root)
-
     existing_livery_target = livery_package_root if livery_package_root.exists() else None
     if existing_livery_target and is_reparse_point(existing_livery_target) and not allow_linked_targets:
         raise InstallerError(
@@ -890,6 +1116,157 @@ def validate_install_safety(
             )
 
 
+def checked_livery_target(package_root: Path, allow_linked_targets: bool = False) -> Path:
+    target = ensure_livery_package_root(package_root)
+    for path in (target, *target.parents):
+        if path.exists() and is_reparse_point(path) and not allow_linked_targets:
+            raise InstallerError(
+                f"Target uses a symlink/junction: {path}. Enable Allow linked targets only "
+                "if you intend to modify its real location."
+            )
+    resolved = target.resolve()
+    # Opt-in permits a linked package root, never nested links in the package.
+    plain_tree(resolved)
+    return resolved
+
+
+def prepare_install_plan(source: Path, selected: Path, target: Path, overwrite: bool) -> InstallPlan:
+    checkpoint("Inspecting livery structure and compatibility", force=True)
+    plain_tree(source)
+    packages = find_livery_package_roots(source)
+    simobjects = find_simobjects_roots(source)
+    files: list[tuple[Path, Path]] = []
+    warnings = []
+    liveries = []
+    source_package = None
+    expected_name = ensure_livery_package_root(selected).name.lower()
+    if len(packages) > 1 or (not packages and len(simobjects) > 1):
+        raise InstallerError("Multiple aircraft packages found. Select one extracted package folder at a time; none was installed.")
+    if packages or simobjects:
+        content_root = (packages or simobjects)[0]
+        if packages:
+            source_package = content_root
+            if content_root.name.lower() != expected_name:
+                raise InstallerError(f"Aircraft mismatch: source {content_root.name}, target {expected_name}.")
+        aircraft_root = content_root / "SimObjects" / "Airplanes"
+        known = known_airplane_folder_name(selected)
+        installed_airplanes = selected / "SimObjects" / "Airplanes"
+        allowed = {p.name.casefold() for p in installed_airplanes.iterdir() if p.is_dir()} if installed_airplanes.exists() else set()
+        if known:
+            allowed.add(known.casefold())
+        for aircraft in aircraft_root.iterdir():
+            if not aircraft.is_dir():
+                continue
+            if aircraft.name.casefold() not in allowed:
+                raise InstallerError(f"Aircraft/variant mismatch: {aircraft.name}. Select the matching aircraft package; expected {', '.join(sorted(allowed))}.")
+            parent = aircraft / "liveries" / "pmdg"
+            found = [p for p in parent.iterdir() if p.is_dir() and looks_like_livery_folder(p)] if parent.is_dir() else []
+            if not found:
+                raise InstallerError(f"Unsupported aircraft structure in {aircraft.name}. Expected MSFS 2024 liveries/pmdg/<livery>. MSFS 2020 aircraft.cfg packages are not converted.")
+            liveries.extend(f"{aircraft.name}/{p.name}" for p in found)
+        for path in content_root.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(content_root)
+            if should_skip_root_item(Path(rel.parts[0])):
+                if not (packages and rel.as_posix().lower() == "manifest.json" and (overwrite or not (target / "manifest.json").exists())):
+                    continue
+            files.append((path, rel))
+    else:
+        direct = find_direct_livery_folders(source)
+        if not direct:
+            ptp = next(source.rglob("*.ptp"), None)
+            if ptp:
+                raise InstallerError("This ZIP contains PTP files. PTP import is unsupported; download an MSFS 2024 ZIP or extracted livery folder.")
+            raise InstallerError("No installable livery found. Expected an MSFS 2024 PMDG livery.cfg or compatible texture folder.")
+        aircraft = get_airplane_folder_name(selected, target)
+        for folder in direct:
+            if (folder / "aircraft.cfg").exists() and not (folder / "livery.cfg").exists():
+                raise InstallerError("This appears to be a legacy aircraft.cfg livery. MSFS 2020 conversion is not supported.")
+            relroot = Path("SimObjects") / "Airplanes" / aircraft / "liveries" / "pmdg" / folder.name
+            liveries.append(f"{aircraft}/{folder.name}")
+            for path in folder.rglob("*"):
+                if path.is_file():
+                    files.append((path, relroot / path.relative_to(folder)))
+        warnings.append("Direct folders do not reliably identify simulator version or winglet/engine variant. Confirm that the download is for this MSFS 2024 aircraft.")
+    if not liveries or not files:
+        raise InstallerError("No livery files were found in the selected package.")
+    # Explicit aircraft references are evidence; absence is not compatibility.
+    expected_aircraft = known_airplane_folder_name(selected)
+    if expected_aircraft:
+        for path, relative in files:
+            if path.name.lower() not in {"livery.cfg", "aircraft.cfg"}:
+                continue
+            aircraft = relative.parts[2] if len(relative.parts) >= 3 else expected_aircraft
+            expected_model = re.search(r"(?:737|777)-\d+[A-Z]*", aircraft, re.I)
+            text = "\n".join(line for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+                             if line.strip().lower().startswith("base_container"))
+            for model in re.findall(r"PMDG[ _-]*((?:737|777)-\d+[A-Z]*)", text, re.I):
+                if expected_model and model.upper() != expected_model.group().upper():
+                    family = re.match(r"(?:737|777)-\d+", model, re.I).group().upper()
+                    expected_family = re.match(r"(?:737|777)-\d+", expected_model.group(), re.I).group().upper()
+                    source_variant = model.upper()[len(family):]
+                    target_variant = expected_model.group().upper()[len(expected_family):]
+                    if family != expected_family or (source_variant and target_variant and source_variant != target_variant):
+                        raise InstallerError(f"Aircraft reference mismatch in {path.name}: {model}; selected {aircraft}.")
+                    warnings.append(f"Variant reference {model} found. Confirm that this variant is installed; generic aircraft names cannot establish variant compatibility.")
+    seen = set()
+    conflicts = []
+    total = 0
+    for path, rel in files:
+        checkpoint(f"Checking destination: {rel.name}")
+        key = rel.as_posix().casefold()
+        if key in seen:
+            raise InstallerError(f"Duplicate destination in source: {rel}")
+        seen.add(key)
+        destination = target / rel
+        if destination.exists():
+            if not destination.is_file():
+                raise InstallerError(f"Destination is a folder, but source is a file: {destination}")
+            conflicts.append(rel.as_posix())
+        for parent in destination.parents:
+            if parent == target:
+                break
+            if parent.exists() and not parent.is_dir():
+                raise InstallerError(f"A destination parent is not a folder: {parent}")
+        total += path.stat().st_size
+    warnings.append("File checks cannot confirm in-simulator loading. Check this aircraft's livery list in MSFS 2024 after installation.")
+    return InstallPlan(target, files, sorted(liveries), conflicts, warnings, total, source_package)
+
+
+def preview_install(livery_input: Path, package_root: Path, overwrite: bool = False,
+                    allow_linked_targets: bool = False) -> InstallPlan:
+    selected = validate_selected_package_root(package_root)
+    target = checked_livery_target(selected, allow_linked_targets)
+    with temporary_workspace(target) as tmp:
+        source = source_root_from_input(livery_input, tmp)
+        validate_install_safety(livery_input, source, selected, target, allow_linked_targets)
+        plan = prepare_install_plan(source, selected, target, overwrite)
+        thumbnails = [path for path, _ in plan.files if path.suffix.lower() in THUMBNAIL_EXTENSIONS
+                      and path.stem.lower().startswith("thumbnail")]
+        if thumbnails:
+            try:
+                from PIL import Image
+                with Image.open(thumbnails[0]) as image:
+                    image.thumbnail((480, 150))
+                    output = io.BytesIO()
+                    image.convert("RGBA").save(output, format="PNG")
+                    plan.preview_png = output.getvalue()
+            except (ImportError, OSError, ValueError):
+                plan.warnings.append("The source thumbnail could not be previewed; livery file checks still apply.")
+        return plan
+
+
+def format_install_plan(plan: InstallPlan) -> str:
+    lines = [f"Target: {plan.target}", f"Liveries: {len(plan.liveries)}", *[f"  {name}" for name in plan.liveries],
+             f"Files: {len(plan.files)} ({format_bytes(plan.total_size)})", f"Existing files to replace: {len(plan.conflicts)}"]
+    lines.extend(f"  {path}" for path in plan.conflicts[:20])
+    if len(plan.conflicts) > 20:
+        lines.append(f"  ... and {len(plan.conflicts) - 20} more")
+    lines.extend(f"Note: {warning}" for warning in plan.warnings)
+    return "\n".join(lines)
+
+
 def install_livery(
     livery_input: Path,
     package_root: Path,
@@ -898,7 +1275,7 @@ def install_livery(
     allow_linked_targets: bool = False,
 ) -> InstallReport:
     selected_package_root = validate_selected_package_root(package_root)
-    livery_package_root = ensure_livery_package_root(selected_package_root)
+    livery_package_root = checked_livery_target(selected_package_root, allow_linked_targets)
 
     with temporary_workspace(livery_package_root) as tmp:
         source_root = source_root_from_input(livery_input, tmp)
@@ -910,65 +1287,38 @@ def install_livery(
             allow_linked_targets=allow_linked_targets,
         )
 
-        livery_package_roots = find_livery_package_roots(source_root)
-        if livery_package_roots:
-            source_package_root = livery_package_roots[0]
-            if source_package_root.name.lower() != livery_package_root.name.lower():
-                raise InstallerError(
-                    "The livery package does not match the selected aircraft package. "
-                    f"Source is {source_package_root.name}, target is {livery_package_root.name}."
-                )
-            livery_package_root.mkdir(parents=True, exist_ok=True)
-            copied_files, copied_dirs, installed_roots = copy_livery_package_contents(
-                source_package_root,
-                livery_package_root,
-                overwrite=overwrite,
-            )
-            ensure_livery_package_skeleton(livery_package_root, selected_package_root)
-        else:
-            source_package_root = None
-            ensure_livery_package_skeleton(livery_package_root, selected_package_root)
-            simobjects_roots = find_simobjects_roots(source_root)
-            if simobjects_roots:
-                copy_root = simobjects_roots[0]
-                copied_files, copied_dirs, installed_roots = copy_package_contents(
-                    copy_root,
-                    livery_package_root,
-                    overwrite=overwrite,
-                )
-            else:
-                livery_folders = find_direct_livery_folders(source_root)
-                if not livery_folders:
-                    raise InstallerError(
-                        "No installable livery structure found. Expected a PMDG "
-                        "*-liveries package, a SimObjects folder, or a livery folder "
-                        "containing livery.cfg/texture/model/panel."
-                    )
-                copied_files, copied_dirs, installed_roots = copy_direct_liveries(
-                    livery_folders,
-                    selected_package_root,
-                    livery_package_root,
-                    overwrite=overwrite,
-                )
-
-    layout_entries, manifest_updated, backup_path = rebuild_layout(
-        livery_package_root,
-        backup=backup_layout,
-    )
+        plan = prepare_install_plan(source_root, selected_package_root, livery_package_root, overwrite)
+        if plan.conflicts and not overwrite:
+            raise InstallerError(f"{len(plan.conflicts)} destination file(s) already exist. Review the preflight report and enable Allow overwrite to replace them. First: {plan.conflicts[0]}")
+        if shutil.disk_usage(livery_package_root.parent).free < plan.total_size * 2 + sum(p.stat().st_size for p in livery_package_root.rglob("*") if p.is_file()):
+            raise InstallerError("Not enough disk space for this install and its recoverable package copy.")
+        with PackageTransaction(livery_package_root, "install") as transaction:
+            for index, (source, relative) in enumerate(plan.files, 1):
+                checkpoint(f"Installing file {index}/{len(plan.files)}: {relative.name}")
+                copy_file(source, transaction.stage / relative)
+            ensure_livery_package_skeleton(transaction.stage, selected_package_root)
+            layout_entries, manifest_updated, backup_path = rebuild_layout(transaction.stage, backup=backup_layout)
+            recovery = transaction.commit()
+            if backup_path:
+                backup_path = livery_package_root / backup_path.name
+    installed_roots = [livery_package_root / "SimObjects" / "Airplanes" / name.split("/")[0] / "liveries" / "pmdg" / name.split("/", 1)[1] for name in plan.liveries]
     return InstallReport(
         package_root=livery_package_root,
-        source_package_root=source_package_root,
-        copied_files=copied_files,
-        copied_dirs=copied_dirs,
+        source_package_root=normalize_path(livery_input) if plan.source_package else None,
+        copied_files=len(plan.files),
+        copied_dirs=len({rel.parent for _, rel in plan.files}),
         layout_entries=layout_entries,
         manifest_updated=manifest_updated,
         backup_path=backup_path,
         installed_roots=installed_roots,
+        recovery_path=recovery,
+        warnings=plan.warnings,
     )
 
 
 def format_report(report: InstallReport) -> str:
     lines = [
+        "File copy and layout validation passed.",
         f"Livery package: {report.package_root}",
         f"Copied files: {report.copied_files}",
         f"Copied folders: {report.copied_dirs}",
@@ -979,6 +1329,9 @@ def format_report(report: InstallReport) -> str:
         lines.append(f"Source package: {report.source_package_root}")
     if report.backup_path:
         lines.append(f"layout backup: {report.backup_path}")
+    if report.recovery_path:
+        lines.append(f"Full recovery backup: {report.recovery_path}")
+    lines.extend(f"Note: {warning}" for warning in report.warnings)
     if report.installed_roots:
         lines.append("Installed roots:")
         lines.extend(f"  - {path}" for path in report.installed_roots)
@@ -1007,10 +1360,12 @@ def format_uninstall_report(report: UninstallReport) -> str:
     ]
     if report.backup_path:
         lines.append(f"layout backup: {report.backup_path}")
+    if report.recovery_path:
+        lines.append(f"Full recovery backup: {report.recovery_path}")
     return "\n".join(lines)
 
 
-def launch_gui() -> None:
+def launch_gui(run_mainloop: bool = True, detect_on_start: bool = True):
     if sys.platform == "win32":
         try:
             import ctypes
@@ -1025,36 +1380,20 @@ def launch_gui() -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
+    from livery_ui import COLORS as UI_COLORS, build_interface
+    from app_version import VERSION
+
     class InstallerApp(tk.Tk):
-        COLORS = {
-            "bg": "#19211f",
-            "top": "#111817",
-            "sidebar": "#141b19",
-            "sidebar_active": "#24342f",
-            "panel": "#242d2a",
-            "panel_alt": "#2d3834",
-            "field": "#171e1c",
-            "log": "#121715",
-            "line": "#34423d",
-            "line_soft": "#29342f",
-            "muted": "#a8b3ad",
-            "text": "#f2f4ef",
-            "red": "#f05262",
-            "red_hover": "#ff6a55",
-            "amber": "#e7bd55",
-            "green": "#62d08c",
-            "cyan": "#36b6cf",
-            "blue": "#3578c6",
-            "blue_hover": "#4791db",
-            "button": "#2d3935",
-            "button_hover": "#3a4943",
-        }
+        COLORS = UI_COLORS
+
+        asset_path = staticmethod(app_resource_path)
+        format_size = staticmethod(format_bytes)
 
         def __init__(self) -> None:
             super().__init__()
-            self.title("PMDG Livery Installer MSFS2024")
-            self.geometry("1280x780")
-            self.minsize(1120, 680)
+            self.title(f"PMDG Livery Installer MSFS2024 · v{VERSION}")
+            self.geometry("1360x860")
+            self.minsize(1180, 780)
             self.configure(bg=self.COLORS["bg"])
             icon_path = app_resource_path("assets/pmdg_livery_installer_icon.ico")
             if icon_path.exists():
@@ -1075,6 +1414,15 @@ def launch_gui() -> None:
             self.thumbnail_image = None
             self.nav_buttons: dict[str, tk.Button] = {}
             self.pages: dict[str, tk.Frame] = {}
+            self.busy = False
+            self.job_queue = queue.Queue()
+            self.job_control = None
+            self.close_when_idle = False
+            self.disabled_widgets = []
+            self.search_var = tk.StringVar()
+            self.thumbnail_filter_var = tk.StringVar(value="All")
+            self.hide_paths_var = tk.BooleanVar(value=True)
+            self.thumbnail_cache = {}
             self.settings_path = (
                 Path(os.environ.get("APPDATA", Path.home()))
                 / "PMDG Livery Installer MSFS2024"
@@ -1083,8 +1431,105 @@ def launch_gui() -> None:
             self._load_settings()
 
             self._build_ui()
-            self.detect_paths()
-            self.show_page("Liveries")
+            self.protocol("WM_DELETE_WINDOW", self.on_close)
+            self.after(80, self.poll_job)
+            if detect_on_start:
+                self.after(100, self.detect_paths)
+            self.show_page("Installed")
+
+        def walk_widgets(self, parent):
+            for child in parent.winfo_children():
+                yield child
+                yield from self.walk_widgets(child)
+
+        def run_job(self, title, work, done):
+            if self.busy:
+                return
+            self.busy = True
+            self.job_done = done
+            self.job_title = title
+            self.job_control = OperationControl(notify=lambda text: self.job_queue.put(("progress", text)))
+            self.disabled_widgets = []
+            for widget in self.walk_widgets(self):
+                if widget in self.nav_buttons.values() or widget is self.cancel_button:
+                    continue
+                if isinstance(widget, (tk.Button, tk.Entry, tk.Checkbutton, tk.Listbox, ttk.Combobox)):
+                    self.disabled_widgets.append((widget, str(widget.cget("state"))))
+                    widget.configure(state="disabled")
+            self.cancel_button.configure(state="normal")
+            self.progress_bar.start(12)
+            self.status_var.set(title)
+            self.log(title)
+            control = self.job_control
+
+            def worker():
+                try:
+                    with operation_context(control):
+                        result = work()
+                    self.job_queue.put(("result", result))
+                except Exception as exc:
+                    self.job_queue.put(("error", exc))
+
+            threading.Thread(target=worker, name="Livery worker", daemon=False).start()
+
+        def poll_job(self):
+            try:
+                for _ in range(200):
+                    kind, payload = self.job_queue.get_nowait()
+                    if kind == "thumbnail":
+                        self.finish_thumbnail(payload)
+                        continue
+                    if kind == "progress":
+                        self.status_var.set(payload[:110])
+                        continue
+                    self.busy = False
+                    self.progress_bar.stop()
+                    self.cancel_button.configure(state="disabled")
+                    for widget, state in self.disabled_widgets:
+                        if widget.winfo_exists():
+                            widget.configure(state=state)
+                    self.disabled_widgets = []
+                    if kind == "error":
+                        self.log(f"{self.job_title}: {payload}")
+                        self.status_var.set("Cancelled" if isinstance(payload, OperationCancelled) else "Operation failed")
+                        if not isinstance(payload, OperationCancelled) and not self.close_when_idle:
+                            messagebox.showerror(self.job_title, str(payload), parent=self)
+                    else:
+                        self.status_var.set(f"{self.job_title}: complete")
+                        if not self.close_when_idle:
+                            try:
+                                self.job_done(payload)
+                            except Exception as exc:
+                                self.log(f"Result display failed: {exc}")
+                                messagebox.showerror("Result display failed", str(exc), parent=self)
+                    if self.close_when_idle:
+                        self.destroy()
+                        return
+            except queue.Empty:
+                pass
+            self.after(80, self.poll_job)
+
+        def cancel_job(self):
+            if self.busy and self.job_control:
+                self.job_control.cancelled.set()
+                self.status_var.set("Cancel requested; waiting for a safe stopping point")
+                self.cancel_button.configure(state="disabled")
+
+        def on_close(self):
+            if self.busy:
+                self.close_when_idle = True
+                self.cancel_job()
+            else:
+                self.destroy()
+
+        def destroy(self):
+            if hasattr(self, "gallery"):
+                self.gallery.close()
+            # Cancel recurring callbacks before their Tcl commands disappear.
+            for after_id in self.tk.call("after", "info"):
+                # Each widget owns its callback command; let its destroy remove it.
+                self.tk.call("after", "cancel", after_id)
+            super().destroy()
 
         def color(self, name: str) -> str:
             return self.COLORS[name]
@@ -1111,171 +1556,8 @@ def launch_gui() -> None:
             self.status_var.set("Settings saved")
             self.log(f"Settings saved: {self.settings_path}")
 
-        def _build_ui(self) -> None:
-            self.option_add("*Font", ("Segoe UI", 10))
-            self.option_add("*TCombobox*Listbox.background", self.color("field"))
-            self.option_add("*TCombobox*Listbox.foreground", self.color("text"))
-            self.option_add("*TCombobox*Listbox.selectBackground", self.color("blue"))
-            self.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
-
-            style = ttk.Style(self)
-            style.theme_use("clam")
-            style.configure(
-                "PMDG.TCombobox",
-                fieldbackground=self.color("field"),
-                background=self.color("field"),
-                foreground=self.color("text"),
-                bordercolor=self.color("line_soft"),
-                lightcolor=self.color("line_soft"),
-                darkcolor=self.color("line_soft"),
-                arrowcolor=self.color("cyan"),
-                padding=5,
-            )
-            style.map(
-                "PMDG.TCombobox",
-                fieldbackground=[("readonly", self.color("field")), ("!disabled", self.color("field"))],
-                background=[("readonly", self.color("field")), ("!disabled", self.color("field"))],
-                foreground=[("readonly", self.color("text")), ("!disabled", self.color("text"))],
-                selectbackground=[("readonly", self.color("field"))],
-                selectforeground=[("readonly", self.color("text"))],
-            )
-            style.configure(
-                "PMDG.Treeview",
-                background=self.color("log"),
-                fieldbackground=self.color("log"),
-                foreground=self.color("text"),
-                bordercolor=self.color("line"),
-                lightcolor=self.color("line"),
-                darkcolor=self.color("line"),
-                rowheight=24,
-                font=("Segoe UI", 9),
-            )
-            style.configure(
-                "PMDG.Treeview.Heading",
-                background=self.color("panel_alt"),
-                foreground=self.color("text"),
-                bordercolor=self.color("line"),
-                relief=tk.FLAT,
-                font=("Segoe UI", 9, "bold"),
-            )
-            style.map(
-                "PMDG.Treeview",
-                background=[("selected", self.color("blue"))],
-                foreground=[("selected", "#ffffff")],
-            )
-            style.configure(
-                "PMDG.Vertical.TScrollbar",
-                background=self.color("panel_alt"),
-                troughcolor=self.color("log"),
-                bordercolor=self.color("log"),
-                arrowcolor=self.color("muted"),
-                relief=tk.FLAT,
-            )
-
-            topbar = tk.Frame(self, bg=self.color("top"), height=72)
-            topbar.pack(fill=tk.X)
-            topbar.pack_propagate(False)
-
-            brand = tk.Frame(topbar, bg=self.color("top"))
-            brand.pack(side=tk.LEFT, padx=16, pady=12)
-            tk.Label(
-                brand,
-                text="PMDG",
-                bg=self.color("panel_alt"),
-                fg="#ffffff",
-                font=("Segoe UI", 11, "bold"),
-                width=6,
-                pady=6,
-            ).pack(side=tk.LEFT)
-            tk.Frame(brand, bg=self.color("cyan"), width=3, height=30).pack(side=tk.LEFT, padx=(0, 10))
-            title_box = tk.Frame(brand, bg=self.color("top"))
-            title_box.pack(side=tk.LEFT)
-            tk.Label(
-                title_box,
-                text="PMDG Livery Installer MSFS2024",
-                bg=self.color("top"),
-                fg="#ffffff",
-                font=("Segoe UI Semibold", 13),
-                anchor="w",
-            ).pack(anchor="w")
-            tk.Label(
-                topbar,
-                textvariable=self.status_var,
-                bg=self.color("panel"),
-                fg=self.color("green"),
-                font=("Segoe UI", 9),
-                anchor="e",
-                padx=10,
-                pady=5,
-            ).pack(side=tk.RIGHT, padx=16)
-            tk.Frame(self, bg=self.color("cyan"), height=2).pack(fill=tk.X)
-
-            body = tk.Frame(self, bg=self.color("bg"))
-            body.pack(fill=tk.BOTH, expand=True)
-
-            sidebar = tk.Frame(body, bg=self.color("sidebar"), width=172)
-            sidebar.pack(side=tk.LEFT, fill=tk.Y)
-            sidebar.pack_propagate(False)
-            tk.Label(
-                sidebar,
-                text="OPERATIONS",
-                bg=self.color("sidebar"),
-                fg=self.color("cyan"),
-                font=("Segoe UI", 8, "bold"),
-                anchor="w",
-            ).pack(fill=tk.X, padx=14, pady=(14, 6))
-
-            nav_labels = {
-                "Products": "Products",
-                "Installed": "Manage",
-                "Liveries": "Install",
-                "Diagnostics": "Diagnostics",
-                "Settings": "Settings",
-            }
-            for page_name in ("Products", "Installed", "Liveries", "Diagnostics", "Settings"):
-                nav = tk.Button(
-                    sidebar,
-                    text=nav_labels[page_name],
-                    command=lambda name=page_name: self.show_page(name),
-                    bg=self.color("sidebar"),
-                    activebackground=self.color("sidebar_active"),
-                    fg="#c4ccd5",
-                    activeforeground="#ffffff",
-                    relief=tk.FLAT,
-                    bd=0,
-                    cursor="hand2",
-                    font=("Segoe UI", 9),
-                    anchor="w",
-                    padx=14,
-                    pady=8,
-                )
-                nav.pack(fill=tk.X, pady=(1, 0))
-                self.nav_buttons[page_name] = nav
-            tk.Label(
-                sidebar,
-                text="MSFS 2024\nCommunity Package Mode",
-                bg=self.color("sidebar"),
-                fg=self.color("muted"),
-                justify=tk.LEFT,
-                font=("Segoe UI", 8),
-                anchor="sw",
-            ).pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=14)
-
-            self.page_container = tk.Frame(body, bg=self.color("bg"))
-            self.page_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=12, pady=12)
-            self.page_container.rowconfigure(0, weight=1)
-            self.page_container.columnconfigure(0, weight=1)
-
-            for page_name, factory in (
-                ("Products", self._create_products_page),
-                ("Installed", self._create_installed_page),
-                ("Liveries", self._create_liveries_page),
-                ("Diagnostics", self._create_diagnostics_page),
-                ("Settings", self._create_settings_page),
-            ):
-                page = factory()
-                page.grid(row=0, column=0, sticky="nsew")
-                self.pages[page_name] = page
+        def _build_ui(self):
+            build_interface(self)
 
         def label(self, parent, text, size=10, color=None, weight="normal"):
             return tk.Label(
@@ -1328,364 +1610,13 @@ def launch_gui() -> None:
                 font=("Segoe UI", 9),
             )
 
-        def draw_round_rect(self, canvas, fill, outline=None, radius=14):
-            canvas.delete("module")
-            width = max(canvas.winfo_width(), 1)
-            height = max(canvas.winfo_height(), 1)
-            radius = min(radius, width // 2, height // 2)
-            outline = outline or fill
-            canvas.create_rectangle(radius, 0, width - radius, height, fill=fill, outline=fill, tags="module")
-            canvas.create_rectangle(0, radius, width, height - radius, fill=fill, outline=fill, tags="module")
-            canvas.create_oval(0, 0, radius * 2, radius * 2, fill=fill, outline=fill, tags="module")
-            canvas.create_oval(width - radius * 2, 0, width, radius * 2, fill=fill, outline=fill, tags="module")
-            canvas.create_oval(0, height - radius * 2, radius * 2, height, fill=fill, outline=fill, tags="module")
-            canvas.create_oval(width - radius * 2, height - radius * 2, width, height, fill=fill, outline=fill, tags="module")
-            canvas.create_arc(1, 1, radius * 2, radius * 2, start=90, extent=90, outline=outline, width=1, style=tk.ARC, tags="module")
-            canvas.create_arc(width - radius * 2, 1, width - 1, radius * 2, start=0, extent=90, outline=outline, width=1, style=tk.ARC, tags="module")
-            canvas.create_arc(1, height - radius * 2, radius * 2, height - 1, start=180, extent=90, outline=outline, width=1, style=tk.ARC, tags="module")
-            canvas.create_arc(width - radius * 2, height - radius * 2, width - 1, height - 1, start=270, extent=90, outline=outline, width=1, style=tk.ARC, tags="module")
-            canvas.create_line(radius, 1, width - radius, 1, fill=outline, width=1, tags="module")
-            canvas.create_line(radius, height - 1, width - radius, height - 1, fill=outline, width=1, tags="module")
-            canvas.create_line(1, radius, 1, height - radius, fill=outline, width=1, tags="module")
-            canvas.create_line(width - 1, radius, width - 1, height - radius, fill=outline, width=1, tags="module")
-            canvas.tag_lower("module")
 
-        def card(self, parent, title, subtitle=None):
-            frame = tk.Frame(parent, bg=parent["bg"], highlightthickness=0)
-            frame.columnconfigure(0, weight=1)
-            frame.rowconfigure(2, weight=1)
-            background = tk.Canvas(frame, bg=parent["bg"], highlightthickness=0, bd=0)
-            background.place(x=0, y=0, relwidth=1, relheight=1)
-            background.bind(
-                "<Configure>",
-                lambda _event, canvas=background: self.draw_round_rect(
-                    canvas,
-                    self.color("panel"),
-                    self.color("line_soft"),
-                ),
-            )
-            header = tk.Frame(frame, bg=self.color("panel"))
-            header.grid(row=1, column=0, sticky="ew", padx=16, pady=(12, 4))
-            self.label(header, title, 10, self.color("text"), "bold").pack(anchor="w")
-            content = tk.Frame(frame, bg=self.color("panel"))
-            content.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
-            content.columnconfigure(0, weight=1)
-            return frame, content
 
-        def make_page(self, headline, subhead):
-            page = tk.Frame(self.page_container, bg=self.color("bg"))
-            page.rowconfigure(1, weight=1)
-            page.columnconfigure(0, weight=1)
-            header = tk.Frame(page, bg=self.color("panel_alt"), highlightthickness=0)
-            header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-            header.columnconfigure(1, weight=1)
-            tk.Frame(header, bg=self.color("blue"), width=5).grid(row=0, column=0, rowspan=2, sticky="ns")
-            self.label(header, headline.upper(), 8, self.color("cyan"), "bold").grid(row=0, column=1, sticky="w", padx=12, pady=(8, 1))
-            self.label(header, subhead, 9, self.color("text")).grid(row=1, column=1, sticky="w", padx=12, pady=(0, 8))
-            return page
 
-        def _create_products_page(self):
-            page = self.make_page("Products", "Scan installed PMDG packages and inspect package health.")
-            content = tk.Frame(page, bg=self.color("bg"))
-            content.grid(row=1, column=0, sticky="nsew")
-            content.rowconfigure(1, weight=1)
-            content.columnconfigure(0, weight=1)
-            content.columnconfigure(1, weight=2)
 
-            summary_card, summary = self.card(content, "Detect Products", "Community packages that look like PMDG aircraft products.")
-            summary_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-            summary.columnconfigure(0, weight=1)
-            tk.Label(
-                summary,
-                textvariable=self.package_count_var,
-                bg=self.color("panel"),
-                fg=self.color("amber"),
-                font=("Segoe UI Semibold", 18),
-                anchor="w",
-            ).grid(row=0, column=0, sticky="ew")
-            actions = tk.Frame(summary, bg=self.color("panel"))
-            actions.grid(row=0, column=1, sticky="e")
-            self.button(actions, "Detect Paths", self.detect_paths).pack(side=tk.LEFT)
-            self.button(actions, "Refresh Products", self.refresh_packages, accent=True).pack(side=tk.LEFT, padx=(10, 0))
 
-            list_card, list_body = self.card(content, "Product List", "Select a product to view package details.")
-            list_card.grid(row=1, column=0, sticky="nsew", padx=(0, 7))
-            list_card.rowconfigure(1, weight=1)
-            list_body.rowconfigure(0, weight=1)
-            self.product_listbox = tk.Listbox(
-                list_body,
-                bg=self.color("log"),
-                fg=self.color("text"),
-                selectbackground=self.color("blue"),
-                selectforeground="#ffffff",
-                relief=tk.FLAT,
-                bd=0,
-                highlightthickness=0,
-                font=("Segoe UI", 10),
-                activestyle="none",
-            )
-            self.product_listbox.grid(row=0, column=0, sticky="nsew")
-            product_scrollbar = ttk.Scrollbar(list_body, orient=tk.VERTICAL, command=self.product_listbox.yview, style="PMDG.Vertical.TScrollbar")
-            product_scrollbar.grid(row=0, column=1, sticky="ns")
-            self.product_listbox.configure(yscrollcommand=product_scrollbar.set)
-            self.product_listbox.bind("<<ListboxSelect>>", self.on_product_select)
 
-            detail_card, detail_body = self.card(content, "Product Details", "Manifest, layout, aircraft folders and livery inventory.")
-            detail_card.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
-            detail_card.rowconfigure(1, weight=1)
-            detail_body.rowconfigure(0, weight=1)
-            self.product_detail_text = tk.Text(
-                detail_body,
-                bg=self.color("log"),
-                fg="#cfd7df",
-                relief=tk.FLAT,
-                bd=0,
-                padx=10,
-                pady=8,
-                wrap="word",
-                font=("Consolas", 9),
-            )
-            self.product_detail_text.grid(row=0, column=0, sticky="nsew")
-            detail_scrollbar = ttk.Scrollbar(detail_body, orient=tk.VERTICAL, command=self.product_detail_text.yview, style="PMDG.Vertical.TScrollbar")
-            detail_scrollbar.grid(row=0, column=1, sticky="ns")
-            self.product_detail_text.configure(yscrollcommand=detail_scrollbar.set)
-            return page
 
-        def _create_installed_page(self):
-            page = self.make_page("Installed", "Manage liveries in the companion Community livery package.")
-            page.rowconfigure(1, weight=1)
-            content = tk.Frame(page, bg=self.color("bg"))
-            content.grid(row=1, column=0, sticky="nsew")
-            content.columnconfigure(0, weight=3)
-            content.columnconfigure(1, weight=2)
-            content.rowconfigure(1, weight=1)
-
-            package_card, package = self.card(content, "Select Aircraft", "Choose a PMDG product and scan its installed livery package.")
-            package_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-            package.columnconfigure(0, weight=1)
-            self.installed_package_combo = ttk.Combobox(package, textvariable=self.package_var, state="readonly", style="PMDG.TCombobox")
-            self.installed_package_combo.grid(row=0, column=0, sticky="ew", padx=(0, 8), ipady=2)
-            self.installed_package_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_installed_liveries())
-            self.button(package, "Refresh Products", self.refresh_packages).grid(row=0, column=1, padx=(0, 8))
-            self.button(package, "Scan Liveries", self.refresh_installed_liveries, accent=True).grid(row=0, column=2)
-
-            list_card, list_body = self.card(content, "Select Livery", "Select a livery to inspect its files and thumbnail.")
-            list_card.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
-            list_card.rowconfigure(1, weight=1)
-            list_body.rowconfigure(0, weight=1)
-            list_body.columnconfigure(0, weight=1)
-            self.installed_tree = ttk.Treeview(
-                list_body,
-                columns=("aircraft", "livery", "files", "size", "modified"),
-                show="headings",
-                selectmode="browse",
-                style="PMDG.Treeview",
-            )
-            self.installed_tree.heading("aircraft", text="Aircraft")
-            self.installed_tree.heading("livery", text="Livery")
-            self.installed_tree.heading("files", text="Files")
-            self.installed_tree.heading("size", text="Size")
-            self.installed_tree.heading("modified", text="Modified")
-            self.installed_tree.column("aircraft", width=155, minwidth=120, stretch=False)
-            self.installed_tree.column("livery", width=320, minwidth=180, stretch=True)
-            self.installed_tree.column("files", width=70, minwidth=60, anchor="e", stretch=False)
-            self.installed_tree.column("size", width=95, minwidth=80, anchor="e", stretch=False)
-            self.installed_tree.column("modified", width=150, minwidth=130, stretch=False)
-            self.installed_tree.grid(row=0, column=0, sticky="nsew")
-            installed_scrollbar = ttk.Scrollbar(list_body, orient=tk.VERTICAL, command=self.installed_tree.yview, style="PMDG.Vertical.TScrollbar")
-            installed_scrollbar.grid(row=0, column=1, sticky="ns")
-            self.installed_tree.configure(yscrollcommand=installed_scrollbar.set)
-            self.installed_tree.bind("<<TreeviewSelect>>", self.on_installed_livery_select)
-
-            preview_card, preview = self.card(content, "Preview & Actions", "Thumbnail, metadata and uninstall controls for the selected livery.")
-            preview_card.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
-            preview_card.rowconfigure(1, weight=1)
-            preview.columnconfigure(0, weight=1)
-            preview.rowconfigure(1, weight=1)
-            preview_shell = tk.Frame(
-                preview,
-                bg=self.color("log"),
-                height=190,
-                highlightthickness=0,
-            )
-            preview_shell.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-            preview_shell.grid_propagate(False)
-            self.thumbnail_label = tk.Label(
-                preview_shell,
-                text="No livery selected",
-                bg=self.color("log"),
-                fg=self.color("muted"),
-                justify=tk.CENTER,
-                font=("Segoe UI", 10),
-            )
-            self.thumbnail_label.place(relx=0.5, rely=0.5, anchor="center")
-
-            self.installed_detail_text = tk.Text(
-                preview,
-                height=7,
-                bg=self.color("log"),
-                fg="#cfd7df",
-                relief=tk.FLAT,
-                bd=0,
-                padx=10,
-                pady=8,
-                wrap="word",
-                font=("Consolas", 9),
-            )
-            self.installed_detail_text.grid(row=1, column=0, sticky="nsew")
-            detail_scrollbar = ttk.Scrollbar(preview, orient=tk.VERTICAL, command=self.installed_detail_text.yview, style="PMDG.Vertical.TScrollbar")
-            detail_scrollbar.grid(row=1, column=1, sticky="ns")
-            self.installed_detail_text.configure(yscrollcommand=detail_scrollbar.set)
-
-            actions = tk.Frame(preview, bg=self.color("panel"))
-            actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-            self.button(actions, "Copy Path", self.copy_installed_livery_path).pack(side=tk.LEFT)
-            self.button(actions, "Refresh", self.refresh_installed_liveries).pack(side=tk.LEFT, padx=(10, 0))
-            self.button(actions, "Uninstall Selected", self.uninstall_selected_livery, danger=True).pack(side=tk.RIGHT)
-            return page
-
-        def _create_liveries_page(self):
-            page = self.make_page("Install", "Install third-party PMDG livery packages without using PMDG OC3.")
-            page.rowconfigure(1, weight=1)
-            content = tk.Frame(page, bg=self.color("bg"))
-            content.grid(row=1, column=0, sticky="nsew")
-            content.columnconfigure(0, weight=1)
-            content.rowconfigure(2, weight=1)
-
-            steps = tk.Frame(content, bg=self.color("bg"))
-            steps.grid(row=0, column=0, sticky="ew")
-            steps.columnconfigure(0, weight=1, uniform="install_steps")
-            steps.columnconfigure(1, weight=1, uniform="install_steps")
-
-            paths_card, paths = self.card(steps, "Community Folder", "Detected automatically; override when needed.")
-            paths_card.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))
-            paths.columnconfigure(1, weight=1)
-            self.label(paths, "Community", 8, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(2, 4))
-            self.entry(paths, self.community_var).grid(row=0, column=1, sticky="ew", pady=(2, 4), ipady=4)
-            self.button(paths, "Browse", self.choose_community).grid(row=0, column=2, padx=(8, 0), pady=(2, 4))
-            self.button(paths, "Detect Paths", self.detect_paths).grid(row=1, column=1, columnspan=2, sticky="e", pady=(4, 0))
-
-            package_card, package = self.card(steps, "Aircraft Package", "Choose the PMDG product to receive the livery.")
-            package_card.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=(0, 8))
-            package.columnconfigure(0, weight=1)
-            tk.Label(
-                package,
-                textvariable=self.package_count_var,
-                bg=self.color("panel"),
-                fg=self.color("amber"),
-                font=("Segoe UI Semibold", 16),
-                anchor="w",
-            ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
-            self.package_combo = ttk.Combobox(package, textvariable=self.package_var, state="readonly", style="PMDG.TCombobox")
-            self.package_combo.grid(row=1, column=0, sticky="ew", padx=(0, 6), ipady=2)
-            self.button(package, "Refresh", self.refresh_packages).grid(row=1, column=1)
-
-            source_card, source = self.card(steps, "Livery Source", "Select a ZIP or extracted livery folder.")
-            source_card.grid(row=1, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))
-            source.columnconfigure(1, weight=1)
-            self.label(source, "Source", 8, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(2, 4))
-            self.entry(source, self.livery_var).grid(row=0, column=1, sticky="ew", pady=(2, 4), ipady=4)
-            browse_menu = tk.Frame(source, bg=self.color("panel"))
-            browse_menu.grid(row=1, column=1, sticky="e", pady=(4, 0))
-            self.button(browse_menu, "ZIP", self.choose_zip).pack(side=tk.LEFT)
-            self.button(browse_menu, "Folder", self.choose_livery_folder).pack(side=tk.LEFT, padx=(8, 0))
-
-            install_card, install = self.card(steps, "Install Options", "Overwrite, backup and install.")
-            install_card.grid(row=1, column=1, sticky="nsew", padx=(5, 0), pady=(0, 8))
-            install.columnconfigure(0, weight=1)
-            options = tk.Frame(install, bg=self.color("panel"))
-            options.grid(row=0, column=0, sticky="w")
-            self.checkbutton(options, "Allow overwrite", self.overwrite_var).grid(row=0, column=0, sticky="w")
-            self.checkbutton(options, "Backup layout.json", self.backup_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
-            self.checkbutton(options, "Allow linked targets", self.allow_linked_targets_var).grid(row=2, column=0, sticky="w", pady=(4, 0))
-            action_bar = tk.Frame(install, bg=self.color("panel"))
-            action_bar.grid(row=1, column=0, sticky="e", pady=(8, 0))
-            self.button(action_bar, "Install Livery", self.install_selected, accent=True).pack(side=tk.LEFT)
-
-            log_card, log_body = self.card(content, "Activity Log", "Detection, copy, layout rebuild and install results.")
-            log_card.grid(row=2, column=0, sticky="nsew")
-            log_card.rowconfigure(1, weight=1)
-            log_body.rowconfigure(0, weight=1)
-            self.log_text = tk.Text(
-                log_body,
-                height=8,
-                wrap="word",
-                bg=self.color("log"),
-                fg="#cfd7df",
-                insertbackground="#ffffff",
-                relief=tk.FLAT,
-                bd=0,
-                padx=10,
-                pady=8,
-                font=("Consolas", 9),
-            )
-            self.log_text.grid(row=0, column=0, sticky="nsew")
-            log_scrollbar = ttk.Scrollbar(log_body, orient=tk.VERTICAL, command=self.log_text.yview, style="PMDG.Vertical.TScrollbar")
-            log_scrollbar.grid(row=0, column=1, sticky="ns")
-            self.log_text.configure(yscrollcommand=log_scrollbar.set)
-            return page
-
-        def _create_diagnostics_page(self):
-            page = self.make_page("Diagnostics", "Validate paths, package writability, layout entries and livery inventory.")
-            page.rowconfigure(1, weight=1)
-            body = tk.Frame(page, bg=self.color("bg"))
-            body.grid(row=1, column=0, sticky="nsew")
-            body.columnconfigure(0, weight=1)
-            body.rowconfigure(1, weight=1)
-
-            tools_card, tools = self.card(body, "Tools", "Run checks before installing or rebuild layout.json after manual changes.")
-            tools_card.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-            self.button(tools, "Run Diagnostics", self.run_diagnostics, accent=True).pack(side=tk.LEFT)
-            self.button(tools, "Detect Paths", self.detect_paths).pack(side=tk.LEFT, padx=(8, 0))
-            self.button(tools, "Rebuild Selected layout.json", self.rebuild_selected_layout).pack(side=tk.LEFT, padx=(8, 0))
-
-            report_card, report = self.card(body, "Diagnostic Report", "Copy this output when troubleshooting missing liveries.")
-            report_card.grid(row=1, column=0, sticky="nsew")
-            report_card.rowconfigure(1, weight=1)
-            report.rowconfigure(0, weight=1)
-            self.diagnostics_text = tk.Text(
-                report,
-                bg=self.color("log"),
-                fg="#cfd7df",
-                relief=tk.FLAT,
-                bd=0,
-                padx=10,
-                pady=8,
-                wrap="word",
-                font=("Consolas", 9),
-            )
-            self.diagnostics_text.grid(row=0, column=0, sticky="nsew")
-            diagnostics_scrollbar = ttk.Scrollbar(report, orient=tk.VERTICAL, command=self.diagnostics_text.yview, style="PMDG.Vertical.TScrollbar")
-            diagnostics_scrollbar.grid(row=0, column=1, sticky="ns")
-            self.diagnostics_text.configure(yscrollcommand=diagnostics_scrollbar.set)
-            return page
-
-        def _create_settings_page(self):
-            page = self.make_page("Settings", "Persist defaults and choose a comfortable window scale.")
-            body = tk.Frame(page, bg=self.color("bg"))
-            body.grid(row=1, column=0, sticky="nsew")
-            body.columnconfigure(0, weight=1)
-
-            settings_card, settings = self.card(body, "Install Behavior", "These settings are shared by the Liveries page.")
-            settings_card.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-            self.checkbutton(settings, "Allow overwrite when matching files already exist", self.overwrite_var).grid(row=0, column=0, sticky="w", pady=(0, 5))
-            self.checkbutton(settings, "Back up layout.json before rebuilding", self.backup_var).grid(row=1, column=0, sticky="w")
-            self.checkbutton(settings, "Allow linked Community targets such as symlinks or junctions", self.allow_linked_targets_var).grid(row=2, column=0, sticky="w", pady=(5, 0))
-
-            paths_card, paths = self.card(body, "Saved Paths", "Stored locally for the next launch.")
-            paths_card.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-            paths.columnconfigure(1, weight=1)
-            self.label(paths, "Community", 8, self.color("muted"), "bold").grid(row=0, column=0, sticky="w", pady=(0, 5))
-            self.entry(paths, self.community_var).grid(row=0, column=1, sticky="ew", pady=(0, 5), ipady=4)
-            self.button(paths, "Browse", self.choose_community).grid(row=0, column=2, padx=(8, 0), pady=(0, 5))
-
-            display_card, display = self.card(body, "Display", "Higher default resolution for a wider workspace.")
-            display_card.grid(row=2, column=0, sticky="ew")
-            self.button(display, "1180 x 720", lambda: self.geometry("1180x720")).pack(side=tk.LEFT)
-            self.button(display, "1280 x 780", lambda: self.geometry("1280x780")).pack(side=tk.LEFT, padx=(8, 0))
-            self.button(display, "1440 x 860", lambda: self.geometry("1440x860")).pack(side=tk.LEFT, padx=(8, 0))
-            self.button(display, "Save Settings", self._save_settings, accent=True).pack(side=tk.RIGHT)
-            return page
 
         def checkbutton(self, parent, text, variable):
             return tk.Checkbutton(
@@ -1711,7 +1642,8 @@ def launch_gui() -> None:
                     font=("Segoe UI", 10, "bold" if active else "normal"),
                 )
             status_name = {"Installed": "Manage", "Liveries": "Install"}.get(page_name, page_name)
-            self.status_var.set(f"{status_name} ready")
+            if not self.busy:
+                self.status_var.set(f"{status_name} ready")
 
         def set_text(self, widget, text: str) -> None:
             widget.configure(state=tk.NORMAL)
@@ -1721,92 +1653,14 @@ def launch_gui() -> None:
 
         def get_selected_package(self) -> Path | None:
             selected = self.package_var.get()
-            if selected in self.package_paths:
-                return self.package_paths[selected]
-            if hasattr(self, "product_listbox"):
-                selection = self.product_listbox.curselection()
-                if selection:
-                    index = selection[0]
-                    if 0 <= index < len(self.detected_packages):
-                        return self.detected_packages[index]
-            if self.detected_packages:
-                return self.detected_packages[0]
+            package = self.package_paths.get(selected)
+            community = self.community_var.get().strip()
+            if package and community and package.parent.resolve() == normalize_path(community):
+                return package
             return None
 
         def describe_package(self, package_root: Path) -> str:
-            known_folder = known_airplane_folder_name(package_root)
-            lines = [f"Package: {package_root}"]
-            if known_folder:
-                lines.append(f"Aircraft: {known_folder}")
-            if not package_root.exists():
-                livery_root = ensure_livery_package_root(package_root)
-                lines.extend(
-                    [
-                        "Status: aircraft package not found in Community",
-                        f"Livery target: {livery_root}",
-                        "",
-                    ]
-                )
-            else:
-                lines.append("")
-            manifest_path = package_root / "manifest.json"
-            if manifest_path.exists():
-                try:
-                    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-                    lines.extend(
-                        [
-                            "Manifest:",
-                            f"  title: {manifest.get('title', 'n/a')}",
-                            f"  package_version: {manifest.get('package_version', 'n/a')}",
-                            f"  total_package_size: {manifest.get('total_package_size', 'n/a')}",
-                            "",
-                        ]
-                    )
-                except (OSError, json.JSONDecodeError) as exc:
-                    lines.extend(["Manifest:", f"  unreadable: {exc}", ""])
-            else:
-                lines.extend(["Manifest:", "  missing", ""])
-
-            layout_path = package_root / "layout.json"
-            if layout_path.exists():
-                try:
-                    layout = json.loads(layout_path.read_text(encoding="utf-8-sig"))
-                    content = layout.get("content", [])
-                    lines.extend(["Layout:", f"  entries: {len(content) if isinstance(content, list) else 'invalid'}", ""])
-                except (OSError, json.JSONDecodeError) as exc:
-                    lines.extend(["Layout:", f"  unreadable: {exc}", ""])
-            else:
-                lines.extend(["Layout:", "  missing", ""])
-
-            airplanes = package_root / "SimObjects" / "Airplanes"
-            aircraft_dirs = [p for p in airplanes.iterdir() if p.is_dir()] if airplanes.exists() else []
-            lines.append("Aircraft folders:")
-            if aircraft_dirs:
-                for aircraft in sorted(aircraft_dirs, key=lambda p: p.name.lower()):
-                    livery_root = aircraft / "liveries" / "pmdg"
-                    livery_count = len([p for p in livery_root.iterdir() if p.is_dir()]) if livery_root.exists() else 0
-                    lines.append(f"  {aircraft.name}: {livery_count} livery folder(s)")
-            else:
-                lines.append("  none found")
-            lines.append("")
-
-            livery_package = ensure_livery_package_root(package_root)
-            lines.append("Companion livery package:")
-            lines.append(f"  path: {livery_package}")
-            lines.append(f"  status: {'present' if livery_package.exists() else 'not created'}")
-            try:
-                installed_liveries = list_installed_liveries(package_root)
-                lines.append(f"  installed liveries: {len(installed_liveries)}")
-            except Exception as exc:  # noqa: BLE001
-                lines.append(f"  livery scan failed: {exc}")
-            lines.append("")
-
-            try:
-                total_files = sum(1 for _ in iter_layout_files(package_root))
-                lines.append(f"Files included by layout builder: {total_files}")
-            except OSError as exc:
-                lines.append(f"File scan failed: {exc}")
-            return "\n".join(lines)
+            return diagnose_package(package_root)
 
         def update_product_views(self) -> None:
             if hasattr(self, "product_listbox"):
@@ -1814,9 +1668,11 @@ def launch_gui() -> None:
                 for package in self.detected_packages:
                     self.product_listbox.insert(tk.END, package.name)
                 if self.detected_packages:
-                    self.product_listbox.selection_set(0)
-                    self.product_listbox.activate(0)
-                    self.set_text(self.product_detail_text, self.describe_package(self.detected_packages[0]))
+                    selected = self.get_selected_package()
+                    index = self.detected_packages.index(selected) if selected in self.detected_packages else 0
+                    self.product_listbox.selection_set(index)
+                    self.product_listbox.activate(index)
+                    self.set_text(self.product_detail_text, "Scanning selected product…")
                 else:
                     self.set_text(
                         self.product_detail_text,
@@ -1824,6 +1680,8 @@ def launch_gui() -> None:
                     )
 
         def on_product_select(self, _event=None) -> None:
+            if self.busy:
+                return
             selection = self.product_listbox.curselection()
             if not selection:
                 return
@@ -1832,8 +1690,8 @@ def launch_gui() -> None:
                 if package_path == package:
                     self.package_var.set(label_text)
                     break
-            self.set_text(self.product_detail_text, self.describe_package(package))
-            self.status_var.set(f"Selected {package.name}")
+            if not self.busy:
+                self.refresh_installed_liveries()
 
         def selected_installed_livery(self) -> InstalledLivery | None:
             if not hasattr(self, "installed_tree"):
@@ -1847,8 +1705,7 @@ def launch_gui() -> None:
             lines = [
                 f"Aircraft: {livery.aircraft_name}",
                 f"Livery: {livery.name}",
-                f"Folder: {livery.path}",
-                f"Thumbnail: {livery.thumbnail_path or 'not found'}",
+                f"Registration: {livery.metadata.get('atc_id', 'Not provided')}",
                 f"Files: {livery.file_count}",
                 f"Folders: {livery.folder_count}",
                 f"Size: {format_bytes(livery.total_size)}",
@@ -1861,181 +1718,127 @@ def launch_gui() -> None:
                 for key in ("title", "ui_variation", "atc_id", "icao_airline", "atc_airline"):
                     if key in livery.metadata:
                         lines.append(f"  {key}: {livery.metadata[key]}")
+            lines.extend(["", f"Folder: {livery.path}", f"Thumbnail: {livery.thumbnail_path or 'not found'}"])
             return "\n".join(lines)
 
         def clear_thumbnail(self, message: str) -> None:
+            self.preview_generation = getattr(self, "preview_generation", 0) + 1
             self.thumbnail_image = None
             self.thumbnail_label.configure(image="", text=message, fg=self.color("muted"))
 
-        def load_thumbnail(self, path: Path):
-            max_width = 520
-            max_height = 240
-            try:
-                from PIL import Image, ImageTk  # type: ignore
-
-                with Image.open(path) as image:
-                    image.thumbnail((max_width, max_height))
-                    return ImageTk.PhotoImage(image.copy()), None
-            except ImportError:
-                pass
-            except Exception as exc:  # noqa: BLE001
-                return None, str(exc)
-
-            try:
-                image = tk.PhotoImage(file=str(path))
-                width = max(image.width(), 1)
-                height = max(image.height(), 1)
-                factor = max(
-                    1,
-                    (width + max_width - 1) // max_width,
-                    (height + max_height - 1) // max_height,
-                )
-                if factor > 1:
-                    image = image.subsample(factor, factor)
-                return image, None
-            except Exception as exc:  # noqa: BLE001
-                converted_path, convert_error = self.convert_thumbnail_with_powershell(path, max_width, max_height)
-                if not converted_path:
-                    return None, str(exc) if not convert_error else convert_error
-                try:
-                    image = tk.PhotoImage(file=str(converted_path))
-                    return image, None
-                except Exception as converted_exc:  # noqa: BLE001
-                    return None, str(converted_exc)
-                finally:
-                    try:
-                        converted_path.unlink()
-                    except OSError:
-                        pass
-
-        def convert_thumbnail_with_powershell(self, path: Path, max_width: int, max_height: int) -> tuple[Path | None, str | None]:
-            if sys.platform != "win32":
-                return None, None
-            temp_dir = Path(os.environ.get("TEMP") or os.environ.get("TMP") or Path.cwd())
-            output_path = temp_dir / f"pmdg_livery_thumb_{uuid.uuid4().hex}.png"
-            script = r"""
-& {
-    param([string]$Source, [string]$Dest, [int]$MaxWidth, [int]$MaxHeight)
-    Add-Type -AssemblyName System.Drawing
-    $img = [System.Drawing.Image]::FromFile($Source)
-    try {
-        $scale = [Math]::Min($MaxWidth / $img.Width, $MaxHeight / $img.Height)
-        if ($scale -gt 1) { $scale = 1 }
-        $width = [Math]::Max(1, [int][Math]::Round($img.Width * $scale))
-        $height = [Math]::Max(1, [int][Math]::Round($img.Height * $scale))
-        $bmp = New-Object System.Drawing.Bitmap($width, $height)
-        try {
-            $graphics = [System.Drawing.Graphics]::FromImage($bmp)
-            try {
-                $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-                $graphics.DrawImage($img, 0, 0, $width, $height)
-            } finally {
-                $graphics.Dispose()
-            }
-            $bmp.Save($Dest, [System.Drawing.Imaging.ImageFormat]::Png)
-        } finally {
-            $bmp.Dispose()
-        }
-    } finally {
-        $img.Dispose()
-    }
-}
-"""
-            try:
-                result = subprocess.run(
-                    ["powershell.exe", "-NoProfile", "-Command", script, str(path), str(output_path), str(max_width), str(max_height)],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
-                )
-            except OSError as exc:
-                return None, str(exc)
-            if result.returncode != 0 or not output_path.exists():
-                try:
-                    output_path.unlink()
-                except OSError:
-                    pass
-                detail = (result.stderr or result.stdout or "PowerShell image conversion failed").strip()
-                return None, detail
-            return output_path, None
-
         def show_thumbnail(self, livery: InstalledLivery) -> None:
+            self.clear_thumbnail("Loading thumbnail…" if livery.thumbnail_path else "No thumbnail found")
             if not livery.thumbnail_path:
-                self.clear_thumbnail("No thumbnail found")
                 return
-            image, error = self.load_thumbnail(livery.thumbnail_path)
+            generation = self.preview_generation
+            path = livery.thumbnail_path
+            max_width = max(200, self.thumbnail_label.master.winfo_width() - 20)
+            def load():
+                try:
+                    from PIL import Image
+                    stat = path.stat()
+                    key = (str(path), stat.st_mtime_ns, stat.st_size, max_width)
+                    with Image.open(path) as pixels:
+                        pixels.thumbnail((max_width, 120))
+                        result = pixels.convert("RGBA")
+                    self.job_queue.put(("thumbnail", (generation, key, result, None)))
+                except Exception as exc:
+                    self.job_queue.put(("thumbnail", (generation, None, None, str(exc))))
+            threading.Thread(target=load, name="Thumbnail decoder", daemon=True).start()
+
+        def finish_thumbnail(self, payload):
+            generation, key, pixels, error = payload
+            if generation != self.preview_generation:
+                return
+            if error:
+                self.clear_thumbnail("Thumbnail unavailable")
+                self.log(f"Thumbnail preview: {error}")
+                return
+            from PIL import ImageTk
+            image = self.thumbnail_cache.get(key)
             if image is None:
-                self.clear_thumbnail(f"Thumbnail preview failed\n{error}")
-                return
+                image = ImageTk.PhotoImage(pixels, master=self)
+                if len(self.thumbnail_cache) >= 24:
+                    self.thumbnail_cache.pop(next(iter(self.thumbnail_cache)))
+                self.thumbnail_cache[key] = image
             self.thumbnail_image = image
-            self.thumbnail_label.configure(image=self.thumbnail_image, text="")
+            self.thumbnail_label.configure(image=image, text="")
 
         def refresh_installed_liveries(self) -> None:
-            if not hasattr(self, "installed_tree"):
+            if self.busy:
                 return
             package = self.get_selected_package()
-            existing_items = self.installed_tree.get_children()
-            if existing_items:
-                self.installed_tree.delete(*existing_items)
-            self.installed_livery_items.clear()
-            self.installed_liveries = []
             if not package:
-                self.set_text(self.installed_detail_text, "No PMDG product selected.")
-                self.clear_thumbnail("No product selected")
-                self.status_var.set("Select a PMDG product")
+                self.installed_liveries = []
+                self.render_liveries()
+                self.set_text(self.product_detail_text, "Select a Community folder and aircraft package.")
                 return
 
-            try:
-                liveries = list_installed_liveries(package)
-            except Exception as exc:  # noqa: BLE001
-                self.set_text(self.installed_detail_text, f"Installed livery scan failed:\n{exc}")
-                self.clear_thumbnail("Scan failed")
-                self.status_var.set("Installed livery scan failed")
-                self.log(f"ERROR: installed livery scan failed: {exc}")
-                return
+            def scan():
+                checkpoint("Scanning installed liveries", force=True)
+                return list_installed_liveries(package), self.describe_package(package)
 
-            self.installed_liveries = liveries
-            for index, livery in enumerate(liveries):
+            def complete(result):
+                self.installed_liveries, description = result
+                self.render_liveries()
+                self.set_text(self.product_detail_text, description)
+                self.log(f"Found {len(self.installed_liveries)} liveries in {ensure_livery_package_root(package)}")
+
+            self.run_job("Scanning liveries", scan, complete)
+
+        def render_liveries(self):
+            if not hasattr(self, "installed_tree"):
+                return
+            selected = {str(self.installed_livery_items[iid].path) for iid in self.installed_tree.selection()
+                        if iid in self.installed_livery_items}
+            existing = self.installed_tree.get_children()
+            if existing:
+                self.installed_tree.delete(*existing)
+            self.installed_livery_items.clear()
+            visible = filter_liveries(self.installed_liveries, self.search_var.get(), self.thumbnail_filter_var.get())
+            selection = []
+            for index, livery in enumerate(visible):
                 iid = str(index)
-                modified = (
-                    time.strftime("%Y-%m-%d %H:%M", time.localtime(livery.modified_time))
-                    if livery.modified_time
-                    else "n/a"
-                )
                 self.installed_livery_items[iid] = livery
-                self.installed_tree.insert(
-                    "",
-                    tk.END,
-                    iid=iid,
-                    values=(
-                        livery.aircraft_name,
-                        livery.metadata.get("title") or livery.name,
-                        livery.file_count,
-                        format_bytes(livery.total_size),
-                        modified,
-                    ),
-                )
-
-            if liveries:
-                self.installed_tree.selection_set("0")
-                self.installed_tree.focus("0")
+                self.installed_tree.insert("", tk.END, iid=iid, values=(
+                    livery.aircraft_name, livery.metadata.get("title") or livery.name,
+                    livery.file_count, format_bytes(livery.total_size),
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(livery.modified_time))))
+                if str(livery.path) in selected:
+                    selection.append(iid)
+            self.gallery.set_items(self.installed_livery_items)
+            self.library_summary.set(f"{len(visible)} of {len(self.installed_liveries)} liveries  ·  Ctrl / Shift to select multiple")
+            if visible:
+                self.installed_tree.selection_set(selection or ["0"])
                 self.on_installed_livery_select()
             else:
-                livery_root = ensure_livery_package_root(package)
-                self.set_text(self.installed_detail_text, f"No installed liveries found.\n\nLivery package: {livery_root}")
-                self.clear_thumbnail("No installed liveries")
-            noun = "livery" if len(liveries) == 1 else "liveries"
-            self.status_var.set(f"{len(liveries)} installed {noun}")
-            self.log(f"Found {len(liveries)} installed {noun}.")
+                self.set_text(self.installed_detail_text, "No matching liveries. Clear the search/filter or scan another aircraft.")
+                self.clear_thumbnail("No matching liveries")
+                self.selection_count.set("No livery selected")
+            if not self.busy:
+                self.status_var.set(f"{len(visible)} of {len(self.installed_liveries)} liveries shown")
+
+        def toggle_library_view(self):
+            self.gallery_mode = not self.gallery_mode
+            if self.gallery_mode:
+                self.table_frame.grid_remove()
+                self.gallery.grid(row=0, column=0, sticky="nsew")
+            else:
+                self.gallery.grid_remove()
+                self.table_frame.grid(row=0, column=0, sticky="nsew")
 
         def on_installed_livery_select(self, _event=None) -> None:
+            self.gallery.highlight(self.installed_tree.selection())
+            self.selection_count.set(f"{len(self.selected_liveries())} selected")
             livery = self.selected_installed_livery()
             if not livery:
+                self.clear_thumbnail("Select a livery")
+                self.set_text(self.installed_detail_text, "Select a livery to see its details.")
                 return
             self.set_text(self.installed_detail_text, self.installed_livery_details(livery))
             self.show_thumbnail(livery)
-            self.status_var.set(f"Selected {livery.name}")
+            if not self.busy:
+                self.status_var.set(f"{len(self.selected_liveries())} selected: {livery.name}")
 
         def copy_installed_livery_path(self) -> None:
             livery = self.selected_installed_livery()
@@ -2046,154 +1849,179 @@ def launch_gui() -> None:
             self.clipboard_append(str(livery.path))
             self.status_var.set("Livery path copied")
 
+        def selected_liveries(self):
+            return [self.installed_livery_items[iid] for iid in self.installed_tree.selection()
+                    if iid in self.installed_livery_items]
+
         def uninstall_selected_livery(self) -> None:
             package = self.get_selected_package()
-            livery = self.selected_installed_livery()
-            if not package or not livery:
-                messagebox.showerror("Missing livery", "Select an installed livery first.")
+            selected = self.selected_liveries()
+            if not package or not selected or self.busy:
                 return
-
-            confirmed = messagebox.askyesno(
-                "Uninstall livery",
-                f"Remove this livery folder?\n\n{livery.aircraft_name}/{livery.name}\n\n{livery.path}",
-            )
-            if not confirmed:
+            names = "\n".join(f"{livery.aircraft_name}/{livery.name}" for livery in selected)
+            if not messagebox.askyesno("Uninstall selected liveries", f"Remove {len(selected)} liveries?\n\n{names}\n\nA full recovery backup will be kept.", parent=self):
                 return
+            backup, linked_targets = self.backup_var.get(), self.allow_linked_targets_var.get()
 
+            def complete(reports):
+                text = "\n\n".join(format_uninstall_report(report) for report in reports)
+                self.log(text)
+                messagebox.showinfo("Uninstall complete", text, parent=self)
+                self.refresh_installed_liveries()
+
+            self.run_job("Uninstalling liveries", lambda: uninstall_liveries(
+                package, [livery.path for livery in selected], backup, linked_targets), complete)
+
+        def export_selected_liveries(self):
+            package, selected = self.get_selected_package(), self.selected_liveries()
+            if not package or not selected or self.busy:
+                return
+            destination = filedialog.asksaveasfilename(title="Export selected liveries", defaultextension=".zip", filetypes=[("ZIP files", "*.zip")], parent=self)
+            if destination:
+                self.run_job("Exporting liveries", lambda: export_liveries(package, [l.path for l in selected], Path(destination)),
+                             lambda path: messagebox.showinfo("Export complete", f"Saved: {path}\nImport this ZIP through Review & Install.", parent=self))
+
+        def restore_backup(self):
+            package = self.get_selected_package()
+            if not package or self.busy:
+                return
             try:
-                self.status_var.set("Uninstalling livery")
-                report = uninstall_livery(
-                    package,
-                    livery.path,
-                    backup_layout=self.backup_var.get(),
-                    allow_linked_targets=self.allow_linked_targets_var.get(),
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.status_var.set("Uninstall failed")
-                self.log(f"ERROR: {exc}")
-                messagebox.showerror("Uninstall failed", str(exc))
+                target = checked_livery_target(package, self.allow_linked_targets_var.get())
+            except InstallerError as exc:
+                messagebox.showerror("Restore backup", str(exc), parent=self)
                 return
-
-            text = format_uninstall_report(report)
-            self.log(text)
-            self.refresh_installed_liveries()
-            self.update_product_views()
-            self.status_var.set("Uninstall complete")
-            messagebox.showinfo("Uninstall complete", text)
-
-        def writable_status(self, path: Path) -> str:
-            if not path.exists():
-                return "missing"
-            if not path.is_dir():
-                return "not a folder"
-            probe = path / f".pmdg_write_test_{uuid.uuid4().hex}"
-            try:
-                probe.write_text("ok", encoding="utf-8")
-                probe.unlink()
-                return "writable"
-            except OSError as exc:
-                return f"not writable ({exc})"
+            folder = filedialog.askdirectory(title="Choose a backup folder containing recovery.json", initialdir=str(backup_directory(target)), parent=self)
+            if not folder:
+                return
+            if not messagebox.askyesno("Restore complete package", f"Restore this backup?\n{folder}\n\nThis replaces all liveries in:\n{target}\n\nThe current package will also be backed up.", parent=self):
+                return
+            allow = self.allow_linked_targets_var.get()
+            def complete(text):
+                self.log(text)
+                messagebox.showinfo("Restore complete", text, parent=self)
+                self.refresh_installed_liveries()
+            self.run_job("Restoring backup", lambda: restore_package_backup(package, Path(folder), allow), complete)
 
         def run_diagnostics(self) -> None:
-            lines = [
-                "PMDG Livery Installer MSFS2024 Diagnostics",
-                f"Application: {sys.executable}",
-                f"Community: {self.community_var.get().strip() or 'not set'}",
-                "",
-            ]
-
-            community = Path(self.community_var.get().strip()) if self.community_var.get().strip() else None
-            if community:
-                lines.append(f"Community status: {self.writable_status(community)}")
-            lines.append("")
-
             package = self.get_selected_package()
-            if package:
-                lines.append(self.describe_package(package))
-            else:
-                lines.append("No selected PMDG package.")
+            if not package:
+                self.set_text(self.diagnostics_text, "UNKNOWN: Select a Community folder and PMDG aircraft first.")
+                return
+            allow = self.allow_linked_targets_var.get()
+            self.run_job("Checking livery package", lambda: diagnose_package(package, allow),
+                         lambda report: self.set_text(self.diagnostics_text, report))
 
-            self.set_text(self.diagnostics_text, "\n".join(lines))
-            self.status_var.set("Diagnostics complete")
+        def export_diagnostics(self):
+            text = self.diagnostics_text.get("1.0", tk.END).strip()
+            if not text:
+                messagebox.showinfo("Export report", "Run Diagnostics first.", parent=self)
+                return
+            if self.hide_paths_var.get():
+                paths = [Path.home(), Path(sys.executable).parent]
+                if self.community_var.get().strip():
+                    paths.append(Path(self.community_var.get().strip()))
+                package = self.get_selected_package()
+                if package:
+                    target = ensure_livery_package_root(package)
+                    paths.extend([target, target.resolve(), backup_directory(target.resolve())])
+                text = redact_report(text, paths)
+            destination = filedialog.asksaveasfilename(title="Save diagnostic report", defaultextension=".txt", filetypes=[("Text report", "*.txt")], parent=self)
+            if destination:
+                try:
+                    Path(destination).write_text(text + "\n", encoding="utf-8")
+                    self.status_var.set("Diagnostic report exported")
+                except OSError as exc:
+                    messagebox.showerror("Export failed", str(exc), parent=self)
 
         def rebuild_selected_layout(self) -> None:
             package = self.get_selected_package()
             if not package:
-                messagebox.showerror("Missing package", "Select a PMDG package first.")
+                messagebox.showerror("Missing package", "Select a PMDG package first.", parent=self)
                 return
-            try:
-                layout_entries, manifest_updated, backup_path = rebuild_layout(package, backup=self.backup_var.get())
-            except Exception as exc:  # noqa: BLE001
-                self.status_var.set("Layout rebuild failed")
-                messagebox.showerror("Layout rebuild failed", str(exc))
-                return
-            result = [
-                f"Package: {package}",
-                f"layout.json entries: {layout_entries}",
-                f"manifest.json updated: {'yes' if manifest_updated else 'no'}",
-            ]
-            if backup_path:
-                result.append(f"layout backup: {backup_path}")
-            text = "\n".join(result)
-            self.log(text)
-            self.set_text(self.diagnostics_text, text)
-            self.set_text(self.product_detail_text, self.describe_package(package))
-            self.status_var.set("layout.json rebuilt")
+            backup, allow = self.backup_var.get(), self.allow_linked_targets_var.get()
+            def complete(result):
+                target, count, updated, recovery = result
+                text = f"PASS: Rebuilt and verified {count} files.\nLivery package: {target}\nRecovery backup: {recovery}"
+                self.log(text)
+                self.set_text(self.diagnostics_text, text)
+            self.run_job("Rebuilding livery layout", lambda: rebuild_livery_layout(package, backup, allow), complete)
 
         def log(self, message: str) -> None:
             self.log_text.insert(tk.END, message.rstrip() + "\n")
             self.log_text.see(tk.END)
 
         def detect_paths(self) -> None:
-            self.status_var.set("Detecting simulator paths")
-            detected = detect_msfs2024_paths()
-            if detected.community_paths and not self.community_var.get():
-                self.community_var.set(str(detected.community_paths[0]))
-            self.log("Detected UserCfg.opt:")
-            for path in detected.user_cfg_paths:
-                self.log(f"  {path}")
-            self.log("Detected Community folders:")
-            for path in detected.community_paths:
-                self.log(f"  {path}")
-            self.refresh_packages()
-            self.status_var.set("Path detection complete")
+            def complete(candidates):
+                for candidate in candidates:
+                    self.log(f"Community: {candidate.path}\n  Config: {', '.join(map(str, candidate.configs))}\n  Products: {', '.join(candidate.products) or 'none'}\n  Writable (estimate): {candidate.writable}")
+                current = self.community_var.get().strip()
+                if len(candidates) == 1 and not current:
+                    self.community_var.set(str(candidates[0].path))
+                    self.refresh_packages()
+                elif len(candidates) > 1:
+                    self.choose_detected_path(candidates)
+                else:
+                    if not candidates:
+                        self.log("No configured Community folder found. Browse to the MSFS 2024 Community folder.")
+                    self.refresh_packages()
+            self.run_job("Detecting simulator paths", community_candidates, complete)
+
+        def choose_detected_path(self, candidates):
+            dialog = tk.Toplevel(self)
+            dialog.title("Choose the MSFS 2024 Community folder")
+            dialog.geometry("900x430")
+            dialog.transient(self)
+            dialog.grab_set()
+            tk.Label(dialog, text="Multiple locations found. Select the one used by your MSFS 2024 installation.", anchor="w").pack(fill=tk.X, padx=12, pady=12)
+            choices = tk.Listbox(dialog, height=5, exportselection=False)
+            choices.pack(fill=tk.X, padx=12)
+            details = tk.Text(dialog, height=9, wrap="word")
+            details.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+            for candidate in candidates:
+                choices.insert(tk.END, str(candidate.path))
+            def show(_event=None):
+                selection = choices.curselection()
+                if selection:
+                    c = candidates[selection[0]]
+                    self.set_text(details, f"Path: {c.path}\nConfiguration: {', '.join(map(str, c.configs))}\nDetected products: {', '.join(c.products) or 'none'}\nWritable (OS estimate): {c.writable}")
+            choices.bind("<<ListboxSelect>>", show)
+            current = self.community_var.get().strip()
+            matching = next((i for i, c in enumerate(candidates) if str(c.path).casefold() == current.casefold()), 0)
+            choices.selection_set(matching)
+            show()
+            def accept():
+                selection = choices.curselection()
+                if selection:
+                    self.community_var.set(str(candidates[selection[0]].path))
+                    dialog.destroy()
+                    self.refresh_packages()
+            tk.Button(dialog, text="Use Selected Folder", command=accept).pack(pady=(0, 12))
 
         def refresh_packages(self) -> None:
-            self.status_var.set("Scanning PMDG products")
-            self.package_paths.clear()
+            if self.busy:
+                return
             community = self.community_var.get().strip()
             if not community:
-                self.package_combo["values"] = []
-                if hasattr(self, "installed_package_combo"):
-                    self.installed_package_combo["values"] = []
-                self.detected_packages = []
-                self.update_product_views()
-                self.refresh_installed_liveries()
-                self.package_count_var.set("0 products detected")
-                self.status_var.set("Select a Community folder")
+                self.apply_packages([])
                 return
-            packages = find_pmdg_product_roots(Path(community))
+            self.run_job("Scanning PMDG products", lambda: find_pmdg_product_roots(Path(community)), self.apply_packages)
+
+        def apply_packages(self, packages):
+            self.package_paths.clear()
             self.detected_packages = packages
             values = []
             for package in packages:
                 aircraft = known_airplane_folder_name(package)
-                label_name = f"{aircraft} - {package.name}" if aircraft else package.name
-                label = f"{label_name}    ({package})"
+                label = f"{aircraft or package.name}  ·  {package.name}"
                 self.package_paths[label] = package
                 values.append(label)
             self.package_combo["values"] = values
-            if hasattr(self, "installed_package_combo"):
-                self.installed_package_combo["values"] = values
-            if values and self.package_var.get() not in values:
-                self.package_var.set(values[0])
-            if not values:
-                self.package_var.set("")
-            noun = "product" if len(values) == 1 else "products"
-            self.package_count_var.set(f"{len(values)} {noun} detected")
+            self.installed_package_combo["values"] = values
+            if self.package_var.get() not in values:
+                self.package_var.set(values[0] if values else "")
+            self.package_count_var.set(f"{len(values)} products detected")
             self.update_product_views()
             self.refresh_installed_liveries()
-            self.status_var.set("PMDG product scan complete")
-            self.log(f"Found {len(values)} PMDG package(s).")
 
         def choose_community(self) -> None:
             path = filedialog.askdirectory(title="Select MSFS 2024 Community folder")
@@ -2218,52 +2046,75 @@ def launch_gui() -> None:
                 self.status_var.set("Livery folder selected")
 
         def install_selected(self) -> None:
-            selected = self.package_var.get()
-            package_root = self.package_paths.get(selected)
-            if not package_root:
-                self.status_var.set("Missing PMDG product")
-                messagebox.showerror("Missing package", "Select a PMDG package first.")
-                return
+            package_root = self.get_selected_package()
             livery_path = self.livery_var.get().strip()
-            if not livery_path:
-                self.status_var.set("Missing livery source")
-                messagebox.showerror("Missing livery", "Select a livery ZIP or folder first.")
+            if not package_root or not livery_path:
+                messagebox.showerror("Missing selection", "Select a PMDG aircraft and livery ZIP/folder first.", parent=self)
                 return
+            overwrite, backup, allow = self.overwrite_var.get(), self.backup_var.get(), self.allow_linked_targets_var.get()
+            source = Path(livery_path)
 
-            try:
-                self.status_var.set("Installing livery")
-                report = install_livery(
-                    Path(livery_path),
-                    package_root,
-                    overwrite=self.overwrite_var.get(),
-                    backup_layout=self.backup_var.get(),
-                    allow_linked_targets=self.allow_linked_targets_var.get(),
-                )
-            except Exception as exc:  # noqa: BLE001 - GUI should surface all failures.
-                self.status_var.set("Install failed")
-                self.log(f"ERROR: {exc}")
-                messagebox.showerror("Install failed", str(exc))
-                return
+            def review(plan):
+                summary = format_install_plan(plan)
+                self.log(summary)
+                dialog = tk.Toplevel(self)
+                dialog.title("Review livery installation")
+                dialog.geometry("850x560")
+                dialog.configure(bg=self.color("bg"))
+                dialog.transient(self)
+                dialog.grab_set()
+                if plan.preview_png:
+                    preview_image = tk.PhotoImage(data=plan.preview_png, master=dialog)
+                    preview_label = tk.Label(dialog, image=preview_image, text="First detected thumbnail", compound=tk.TOP,
+                                             bg=self.color("bg"), fg=self.color("muted"))
+                    preview_label.image = preview_image
+                    preview_label.pack(pady=6)
+                from livery_ui import text_area
+                report = text_area(dialog)
+                report.insert("1.0", summary)
+                report.configure(state="disabled")
+                actions = tk.Frame(dialog, bg=self.color("bg"))
+                actions.pack(fill=tk.X, padx=12, pady=12)
+                self.button(actions, "Close", dialog.destroy).pack(side=tk.RIGHT)
+                def install():
+                    dialog.destroy()
+                    self.run_job("Installing livery", lambda: install_livery(source, package_root, overwrite, backup, allow), complete)
+                if plan.conflicts and not overwrite:
+                    self.label(actions, "Conflicts found. Close, review Allow replacement, then try again.").pack(side=tk.LEFT)
+                else:
+                    self.button(actions, "Install These Liveries", install, accent=True).pack(side=tk.LEFT)
 
-            text = format_report(report)
-            self.log(text)
-            self.refresh_installed_liveries()
-            self.update_product_views()
-            self.status_var.set("Install complete")
-            messagebox.showinfo("Install complete", text)
+            def complete(report):
+                text = format_report(report)
+                self.log(text)
+                messagebox.showinfo("Files installed and verified", text, parent=self)
+                self.refresh_installed_liveries()
 
-    InstallerApp().mainloop()
+            self.run_job("Inspecting livery source", lambda: preview_install(source, package_root, overwrite, allow), review)
+
+    app = InstallerApp()
+    if run_mainloop:
+        app.mainloop()
+    return app
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from app_version import VERSION
     parser = argparse.ArgumentParser(
         description="Install PMDG MSFS 2024 liveries without PMDG OC3.",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s v{VERSION}")
     parser.add_argument("--detect", action="store_true", help="Print detected MSFS 2024 paths.")
     parser.add_argument("--community", type=Path, help="MSFS 2024 Community folder.")
     parser.add_argument("--package", help="PMDG package folder name, e.g. pmdg-aircraft-738.")
     parser.add_argument("--package-root", type=Path, help="Full PMDG package folder path.")
     parser.add_argument("--livery", type=Path, help="Livery ZIP or extracted livery folder.")
+    parser.add_argument("--preflight", action="store_true", help="Inspect --livery and show targets/conflicts without installing.")
+    parser.add_argument("--diagnose", action="store_true", help="Check the companion livery package and print actions.")
+    parser.add_argument("--rebuild-layout", action="store_true", help="Rebuild and verify the companion livery package index.")
+    parser.add_argument("--restore-backup", type=Path, help="Restore a full recovery folder containing recovery.json.")
+    parser.add_argument("--export-zip", type=Path, help="Export all (or searched) liveries to a ZIP outside the package.")
+    parser.add_argument("--search", default="", help="Filter --list-liveries or --export-zip by name/airline/registration.")
     parser.add_argument("--list-liveries", action="store_true", help="List installed liveries for the selected PMDG package.")
     parser.add_argument("--uninstall-livery", help="Uninstall an installed livery by folder name, Aircraft/Livery name, or full folder path.")
     parser.add_argument("--overwrite", action="store_true", help="Allow overwriting existing files.")
@@ -2301,9 +2152,10 @@ def print_detected_paths() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    arguments = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(arguments)
 
-    if len(sys.argv if argv is None else argv) == 1 or args.gui:
+    if not arguments or args.gui:
         launch_gui()
         return 0
 
@@ -2311,11 +2163,37 @@ def main(argv: list[str] | None = None) -> int:
         print_detected_paths()
         return 0
 
+    if args.preflight or args.diagnose or args.rebuild_layout or args.restore_backup or args.export_zip:
+        try:
+            package = resolve_package_from_args(args)
+            if args.preflight:
+                if not args.livery:
+                    parser.error("--preflight requires --livery")
+                print(format_install_plan(preview_install(args.livery, package, args.overwrite, args.allow_linked_targets)))
+            elif args.diagnose:
+                report = diagnose_package(package, args.allow_linked_targets)
+                print(report)
+                return 2 if "FAIL:" in report else 0
+            elif args.rebuild_layout:
+                target, count, updated, recovery = rebuild_livery_layout(package, not args.no_backup, args.allow_linked_targets)
+                print(f"Verified {count} files in {target}\nRecovery backup: {recovery}")
+            elif args.restore_backup:
+                print(restore_package_backup(package, args.restore_backup, args.allow_linked_targets))
+            else:
+                liveries = filter_liveries(list_installed_liveries(package), args.search)
+                if args.export_zip.exists() and not args.overwrite:
+                    raise InstallerError("Export already exists. Use --overwrite to replace it.")
+                print(export_liveries(package, [livery.path for livery in liveries], args.export_zip))
+        except (InstallerError, OSError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        return 0
+
     if args.list_liveries:
         try:
             package_root = resolve_package_from_args(args)
-            liveries = list_installed_liveries(package_root)
-        except InstallerError as exc:
+            liveries = filter_liveries(list_installed_liveries(package_root), args.search)
+        except (InstallerError, OSError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
         for livery in liveries:
@@ -2340,7 +2218,7 @@ def main(argv: list[str] | None = None) -> int:
                 backup_layout=not args.no_backup,
                 allow_linked_targets=args.allow_linked_targets,
             )
-        except InstallerError as exc:
+        except (InstallerError, OSError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
         print(format_uninstall_report(report))
@@ -2358,7 +2236,7 @@ def main(argv: list[str] | None = None) -> int:
             backup_layout=not args.no_backup,
             allow_linked_targets=args.allow_linked_targets,
         )
-    except InstallerError as exc:
+    except (InstallerError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
