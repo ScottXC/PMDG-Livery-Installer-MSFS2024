@@ -1,3 +1,5 @@
+param([string]$InnoCompiler = $env:ISCC_PATH)
+
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -19,16 +21,30 @@ if (-not (Test-Path -LiteralPath $appExe)) {
   throw "Application executable was not built: $appExe"
 }
 
-$iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+$iscc = if ($InnoCompiler) { Get-Item -LiteralPath $InnoCompiler } else { Get-Command ISCC.exe -ErrorAction SilentlyContinue }
 if (-not $iscc) {
   $candidatePaths = @(
     "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe",
     "${env:ProgramFiles}\Inno Setup 7\ISCC.exe",
     "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-    "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
-    "D:\Software\Inno Setup 7\ISCC.exe",
-    "D:\Software\Inno Setup 6\ISCC.exe"
+    "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
   )
+  # Discover custom installations without publishing a developer's machine path.
+  $uninstallRoots = @(
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+  )
+  foreach ($registryRoot in $uninstallRoots) {
+    Get-ChildItem -LiteralPath $registryRoot -ErrorAction SilentlyContinue |
+      Where-Object { $_.PSChildName -like 'Inno Setup*_is1' } |
+      ForEach-Object {
+        $installation = Get-ItemProperty -LiteralPath $_.PSPath
+        if ($installation.InstallLocation) {
+          $candidatePaths += Join-Path $installation.InstallLocation 'ISCC.exe'
+        }
+      }
+  }
   foreach ($candidate in $candidatePaths) {
     if ($candidate -and (Test-Path -LiteralPath $candidate)) {
       $iscc = Get-Item -LiteralPath $candidate

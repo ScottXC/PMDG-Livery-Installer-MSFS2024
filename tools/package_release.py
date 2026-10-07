@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 import shutil
 import sys
+import subprocess
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,9 +31,17 @@ def build_zip(destination: Path, binary: Path, readme: str, changelog: str) -> N
     hashes.extend(f"{hashlib.sha256(data).hexdigest()}  {name}" for name, data in contents.items())
     contents["SHA256SUMS.txt"] = ("\n".join(hashes) + "\n").encode("utf-8")
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        archive.write(binary, binary.name)
+        entry = zipfile.ZipInfo(binary.name, date_time=(2000, 1, 1, 0, 0, 0))
+        entry.compress_type = zipfile.ZIP_DEFLATED
+        entry.create_system = 0
+        entry.external_attr = 0x20
+        archive.writestr(entry, binary.read_bytes())
         for name, data in contents.items():
-            archive.writestr(name, data)
+            entry = zipfile.ZipInfo(name, date_time=(2000, 1, 1, 0, 0, 0))
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            entry.create_system = 0
+            entry.external_attr = 0x20
+            archive.writestr(entry, data)
     with zipfile.ZipFile(destination) as archive:
         assert archive.testzip() is None, "Archive CRC validation failed"
         for line in hashes:
@@ -94,8 +103,12 @@ My liveries 提供浏览、搜索、导出、卸载及完整包备份恢复。�
         "app-icon.png is the application icon, not a screenshot.\n"
         "未包含新的已核验界面截图。上传说明请见 LISTING.md。\n", encoding="utf-8")
     checksums = RELEASE / f"SHA256SUMS-v{VERSION}.txt"
-    checksums.write_text("\n".join(f"{digest(path)}  {path.name}" for path in (setup, upload, portable_zip)) + "\n", encoding="utf-8")
+    # GitHub normalizes spaces to dots when naming release assets.
+    public_setup = RELEASE / setup.name.replace(" ", ".")
+    shutil.copyfile(setup, public_setup)
+    checksums.write_text("\n".join(f"{digest(path)}  {path.name}" for path in (public_setup, upload, portable_zip)) + "\n", encoding="utf-8")
     print(f"Upload copy: {materials}\nChecksums: {checksums}")
+    subprocess.run([sys.executable, str(ROOT / "tools" / "audit_release_privacy.py")], check=True)
 
 
 if __name__ == "__main__":

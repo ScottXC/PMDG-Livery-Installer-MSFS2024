@@ -350,7 +350,7 @@ def build_interface(app):
     footer.pack(side=tk.BOTTOM, fill=tk.X, padx=24, pady=22)
     text(footer, "MSFS 2024", size=10, bold=True).pack(anchor="w")
     text(footer, "PMDG community liveries", size=8, color=COLORS["muted"]).pack(anchor="w", pady=5)
-    text(footer, f"v{VERSION}  ·  ScottXC", size=9, color=COLORS["muted"]).pack(anchor="w", pady=(10, 0))
+    text(footer, f"v{VERSION}  ·  Community utility", size=9, color=COLORS["muted"]).pack(anchor="w", pady=(10, 0))
     main = tk.Frame(app, bg=COLORS["bg"])
     main.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     task = tk.Frame(main, bg=COLORS["sidebar"], height=48)

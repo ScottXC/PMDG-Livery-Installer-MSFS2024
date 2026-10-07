@@ -360,8 +360,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn("UNKNOWN:", report)
 
     def test_report_redacts_case_insensitive_windows_paths(self):
-        result = app.redact_report(r"Target: C:\Users\Scott\Community\test", [Path(r"c:\users\scott")])
-        self.assertNotIn("Scott", result)
+        result = app.redact_report(r"Target: C:\Users\ExampleUser\Community\test", [Path(r"c:\users\exampleuser")])
+        self.assertNotIn("ExampleUser", result)
         self.assertIn("<PATH_", result)
 
     def test_temporary_workspace_propagates_body_oserror_once(self):

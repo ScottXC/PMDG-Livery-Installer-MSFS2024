@@ -4,6 +4,8 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
 $env:PYTHONPATH = Join-Path $root ".build_tools"
+# Avoid putting the local build time in the executable's PE header.
+$env:SOURCE_DATE_EPOCH = '946684800'
 python -c "import PIL; import PyInstaller"
 if ($LASTEXITCODE -ne 0) {
   throw "Build dependencies missing. Run: python -m pip install --target .build_tools -r requirements-build.txt"
