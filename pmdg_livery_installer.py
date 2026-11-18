@@ -847,6 +847,7 @@ def update_manifest_size(package_root: Path, total_size: int) -> bool:
     return True
 
 
+
 def rebuild_layout(package_root: Path, backup: bool = True) -> tuple[int, bool, Path | None]:
     package_root = validate_package_root(package_root)
     layout_path = package_root / "layout.json"
@@ -855,47 +856,105 @@ def rebuild_layout(package_root: Path, backup: bool = True) -> tuple[int, bool, 
     original_layout = layout_path.read_bytes()
     checkpoint("Rebuilding livery package index", force=True)
     generator_path = layout_generator_path()
+
+    env_tmp = os.environ.get("TEMP") or os.environ.get("TMP")
+    if not env_tmp:
+        raise InstallerError("Windows TEMP/TMP directory is not configured.")
+
+    temp_root = Path(env_tmp)
+    work_dir = temp_root / f"pmdg-layout-{uuid.uuid4().hex[:12]}"
+    temp_package = work_dir / "package"
+    temp_layout = temp_package / "layout.json"
+
     try:
+        work_dir.mkdir(parents=True)
+
+        checkpoint("Copying package to short temporary path", force=True)
+        shutil.copytree(
+            package_root,
+            temp_package,
+            copy_function=shutil.copy2,
+        )
+
+        checkpoint("Rebuilding livery package index", force=True)
+
         process = subprocess.Popen(
-            [str(generator_path), str(layout_path)],
-            cwd=str(package_root),
+            [str(generator_path), str(temp_layout)],
+            cwd=str(temp_package),
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            creationflags=(
+                subprocess.CREATE_NO_WINDOW
+                if hasattr(subprocess, "CREATE_NO_WINDOW")
+                else 0
+            ),
         )
+
         try:
             deadline = time.monotonic() + 120
+
             while True:
                 checkpoint("Rebuilding livery package index (up to 120 seconds)")
+
                 try:
                     stdout, stderr = process.communicate(timeout=0.1)
                     break
                 except subprocess.TimeoutExpired:
                     if time.monotonic() >= deadline:
-                        raise InstallerError("Layout generator timed out after 120 seconds. The active package was not changed.")
+                        raise InstallerError(
+                            "Layout generator timed out after 120 seconds. "
+                            "The active package was not changed."
+                        )
+
             if process.returncode:
-                raise InstallerError(f"MSFSLayoutGenerator failed ({process.returncode}): {(stderr or stdout).strip()}")
+                raise InstallerError(
+                    f"MSFSLayoutGenerator failed ({process.returncode}): "
+                    f"{(stderr or stdout).strip()}"
+                )
+
         finally:
             if process.poll() is None:
                 process.kill()
                 process.communicate()
+
+        if not temp_layout.is_file():
+            raise InstallerError(
+                "MSFSLayoutGenerator finished without producing layout.json."
+            )
+
+        checkpoint("Copying generated layout back to staging", force=True)
+
+        shutil.copy2(temp_layout, layout_path)
+
         entry_count, total_size = validate_layout(package_root)
+
         generated = json.loads(layout_path.read_text(encoding="utf-8-sig"))
-        generated["content"] = [entry for entry in generated["content"]
-                                if not (len(PurePosixPath(entry["path"].replace("\\", "/")).parts) == 1
-                                        and should_skip_root_item(Path(entry["path"])))]
+        generated["content"] = [
+            entry for entry in generated["content"]
+            if not (
+                len(PurePosixPath(entry["path"].replace("\\", "/")).parts) == 1
+                and should_skip_root_item(Path(entry["path"]))
+            )
+        ]
+
         write_json(layout_path, generated)
         manifest_updated = update_manifest_size(package_root, total_size)
+
         if backup:
             timestamp = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
             backup_path = package_root / f"layout.json.bak-{timestamp}"
             backup_path.write_bytes(original_layout)
+
         return entry_count, manifest_updated, backup_path
+
     except BaseException:
         layout_path.write_bytes(original_layout)
         raise
 
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 def validate_layout(package_root: Path) -> tuple[int, int]:
     checkpoint("Validating generated index against package files", force=True)
